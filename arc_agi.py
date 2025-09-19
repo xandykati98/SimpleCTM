@@ -1,3 +1,9 @@
+from datasets import load_dataset
+
+ds = load_dataset("lordspline/arc-agi")
+
+train_ds = ds["training"]
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,14 +15,14 @@ class SimplifiedCTM(nn.Module):
     def __init__(self, n_neurons: int, max_memory: int = 10, max_ticks: int = 10, n_representation_size: int = 4):
         super(SimplifiedCTM, self).__init__()
 
-        self.input_shape: tuple = (1, 28, 28)
+        self.input_shape = None  # Now handles variable input shapes
         self.initial_post = nn.Parameter(torch.normal(0, 1, (n_neurons, max_memory)))
         self.initial_pre = nn.Parameter(torch.normal(0, 1, (n_neurons, max_memory)))
 
         self.max_memory = max_memory
         self.max_ticks = max_ticks
         self.n_neurons = n_neurons
-        self.n_pairs = (n_neurons // 2) // 2
+        self.n_pairs = (n_neurons // 2)
 
         self.pairs = torch.randint(0, n_neurons, (self.n_pairs, 2))
         
@@ -24,17 +30,21 @@ class SimplifiedCTM(nn.Module):
         # Initialize with small positive values to start with some temporal weighting
         self.decay_factors = nn.Parameter(torch.ones(self.n_pairs) * 0.1)
 
-        flattened_input_shape = self.input_shape[1] * self.input_shape[2]
-        
-        # Image encoder - reduces image to n_representation_size-item array, runs only once
-        self.image_encoder = nn.Sequential(
-            nn.Linear(flattened_input_shape, 128),
-            nn.LayerNorm(128),
+        # Image encoder - handles variable input shapes, reduces to n_representation_size
+        # We'll use adaptive pooling to handle any input size
+        self.image_encoder_conv = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Linear(128, 32),
-            nn.LayerNorm(32),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Linear(32, n_representation_size),
+        )
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))  # Always pool to 4x4
+        self.image_encoder_fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16, 64),  # 128 channels * 4 * 4
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, n_representation_size),
         )
         
         # the synapse model is a simple feedforward neural network
@@ -68,24 +78,63 @@ class SimplifiedCTM(nn.Module):
         # Query projection from synchronizations (n_pairs -> attention_dim)
         self.query_projection = nn.Linear(self.n_pairs, self.attention_dim)
         
-        # Synchronization reader - now takes attended features + original synchronizations
-        self.syncronization_reader = nn.Sequential(
+        # Synchronization reader - reconstructs variable-sized images
+        self.syncronization_reader_fc = nn.Sequential(
             nn.Linear(self.attention_dim + self.n_pairs, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
-            nn.Linear(512, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, 10)
+            nn.Linear(512, 256),
+            nn.ReLU()
         )
+        
+        # Adaptive decoder that can reconstruct to any target shape
+        self.adaptive_decoder = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # Fixed large decoder for any grid size up to 30x30 = 900 pixels
+        # This prevents dynamic layer creation which never learns
+        self.large_decoder = nn.Linear(64, 900)
+        
+    def reconstruct_to_shape(self, features: torch.Tensor, target_shape: tuple) -> torch.Tensor:
+        """Reconstruct image from features to specific target shape."""
+        batch_size = features.shape[0]
+        target_height, target_width = target_shape
+        target_size = target_height * target_width
+        
+        if target_size > 900:
+            raise ValueError(f"Target size {target_size} exceeds maximum supported size of 900 (30x30)")
+        
+        # Get features through adaptive decoder
+        decoded_features = self.adaptive_decoder(features)  # (batch_size, 64)
+        
+        # Use fixed large decoder and slice what we need
+        full_output = self.large_decoder(decoded_features)  # (batch_size, 900)
+        output = full_output[:, :target_size]  # (batch_size, target_size)
+        
+        # Reshape to image format and add channel dimension
+        output = output.view(batch_size, 1, target_height, target_width)
+        
+        # Apply sigmoid and scale to [0,9] range for ARC-AGI discrete values
+        output = torch.sigmoid(output) * 9
+        
+        return output
     
-    def forward(self, x: torch.Tensor):
-        # x is a batch of images
+    def forward(self, x: torch.Tensor, target_shape: tuple = None):
+        # x is a batch of images with shape (batch_size, height, width) or (batch_size, 1, height, width)
         batch_size = x.shape[0]
         
-        # Encode the image once at the beginning
-        flattened_x = x.flatten(1)  # shape: (batch_size, 784)
-        encoded_image = self.image_encoder(flattened_x)  # shape: (batch_size, n_representation_size)
+        # Ensure x has channel dimension
+        if len(x.shape) == 3:
+            x = x.unsqueeze(1)  # Add channel dimension: (batch_size, 1, height, width)
+        
+        # Encode the image once at the beginning using new encoder
+        conv_features = self.image_encoder_conv(x)  # (batch_size, 128, height, width)
+        pooled_features = self.adaptive_pool(conv_features)  # (batch_size, 128, 4, 4)
+        encoded_image = self.image_encoder_fc(pooled_features)  # (batch_size, n_representation_size)
         
         # Attention mechanism: input attends to synchronizations
         # Create keys and values from encoded input
@@ -168,60 +217,99 @@ class SimplifiedCTM(nn.Module):
             # Combine attended features with original synchronizations
             combined_features = torch.cat([attended_features, sincronizations_vector], dim=-1)  # Shape: (batch_size, attention_dim + n_pairs)
             
-            sincronizations_read = self.syncronization_reader(combined_features)
-            # get the prediction
-            prediction = sincronizations_read
+            # Process through synchronization reader
+            processed_features = self.syncronization_reader_fc(combined_features)  # (batch_size, 256)
             
-            # Calculate confidence using softmax probabilities
-            prediction_probs = F.softmax(prediction, dim=-1)
-            max_confidence = torch.max(prediction_probs, dim=-1)[0]  # Get max probability for each sample
+            # Reconstruct to target shape if provided, otherwise use original input shape
+            if target_shape is not None:
+                prediction = self.reconstruct_to_shape(processed_features, target_shape)
+            else:
+                # Use original input shape as fallback
+                input_height, input_width = x.shape[-2], x.shape[-1]
+                prediction = self.reconstruct_to_shape(processed_features, (input_height, input_width))
             
-            # Early stopping: if any sample has confidence > 0.8, or we're at the last tick
-            if torch.any(max_confidence > 0.8) or tick == self.max_ticks - 1:
-                return prediction
+        # Return final prediction after all ticks
+        return prediction
 
 
-def train_model(model: SimplifiedCTM, train_loader: DataLoader, optimizer: optim.Optimizer, 
+def train_model_arcagi(model: SimplifiedCTM, optimizer: optim.Optimizer, 
                 criterion: nn.Module, epochs: int, device: torch.device):
     """Training loop for the SimplifiedCTM model."""
     model.train()
     
+    problem_set_count = 0
     for epoch in range(epochs):
         total_loss = 0.0
-        correct = 0
-        total = 0
+        correct_pixels = 0
+        total_pixels = 0
+        problem_set_index = 0
         
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
+        for problem_set in train_ds['train']:
+            problem_index = 0
+            for problem in problem_set:
+                input_matrix = problem['input']
+                target_matrix = problem['output']
+
+                # Convert to tensors and ensure proper shape and dtype
+                data = torch.tensor(input_matrix, dtype=torch.float32).to(device)
+                target = torch.tensor(target_matrix, dtype=torch.float32).to(device)
+                
+                # Ensure data has batch dimension
+                if len(data.shape) == 2:
+                    data = data.unsqueeze(0)  # Add batch dimension
+                if len(target.shape) == 2:
+                    target = target.unsqueeze(0)  # Add batch dimension
+                
+                # Get target shape for reconstruction
+                target_height, target_width = target.shape[-2], target.shape[-1]
+                target_shape = (target_height, target_width)
+                
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass with target shape
+                output = model(data, target_shape)
+                
+                # Flatten target for loss calculation (remove channel dimension if present)
+                if len(target.shape) == 4:  # (batch, channel, height, width)
+                    target_flat = target.squeeze(1)  # Remove channel dimension
+                else:
+                    target_flat = target
+                
+                output_flat = output.squeeze(1)  # Remove channel dimension
+                
+                # Calculate loss (MSE for continuous values, then we can threshold for discrete)
+                loss = criterion(output_flat, target_flat)
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                # Statistics - count correct pixels after rounding to integers
+                total_loss += loss.item()
+                predicted_discrete = torch.round(output_flat).clamp(0, 9)  # Round and clamp to [0,9]
+                target_discrete = torch.round(target_flat).clamp(0, 9)
+                
+                correct_pixels += (predicted_discrete == target_discrete).sum().item()
+                total_pixels += target_discrete.numel()
+                
+                print(f'Epoch: {epoch+1}/{epochs}, Batch: {problem_index}/{len(problem_set)}, Problem Set: {problem_set_index}/{len(train_ds['train'])}, '
+                    f'Loss: {loss.item():.4f}, '
+                    f'Pixel Accuracy: {100.*correct_pixels/total_pixels:.2f}%')
+                problem_index+=1
+            problem_set_index+=1
+            problem_set_count+=1
+            mlflow.log_metric("loss", loss.item(), step=problem_set_count)
+            mlflow.log_metric("pixel_accuracy", 100.*correct_pixels/total_pixels, step=problem_set_count)
             
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            output = model(data)
-            
-            # Calculate loss
-            loss = criterion(output, target)
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # Statistics
-            total_loss += loss.item()
-            _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum().item()
-            
-            if batch_idx % 100 == 0:
-                print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
-                      f'Loss: {loss.item():.4f}, '
-                      f'Accuracy: {100.*correct/total:.2f}%')
-        
-        avg_loss = total_loss / len(train_loader)
-        accuracy = 100. * correct / total
+        avg_loss = total_loss / sum(len(problem_set) for problem_set in train_ds['train'])
+        pixel_accuracy = 100. * correct_pixels / total_pixels
         print(f'Epoch {epoch+1}/{epochs} completed - '
-              f'Average Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+            f'Average Loss: {avg_loss:.4f}, Pixel Accuracy: {pixel_accuracy:.2f}%')
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -249,7 +337,7 @@ def print_model_info(model: nn.Module):
     print(f'  post_activations buffer: {post_act_params:,} elements')
     print(f'=========================\n')
 
-
+import mlflow
 def main():
     """Main training function."""
     # Set device
@@ -262,27 +350,61 @@ def main():
         transforms.Normalize((0.1307,), (0.3081,))
     ])
     
-    # Load MNIST dataset
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-    
     # Initialize model
-    model = SimplifiedCTM(n_neurons=30, max_memory=10, max_ticks=15, n_representation_size=8).to(device)
-    
+    model = SimplifiedCTM(n_neurons=20, max_memory=20, max_ticks=15, n_representation_size=128).to(device)
+    mlflow.set_tracking_uri("http://127.0.0.1:8080")
+    mlflow.set_experiment("arc-agi")
+    mlflow.start_run()
     # Print model information
     print_model_info(model)
     
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Analyze grid sizes and possible values in ARC-AGI training set
+    input_shapes = []
+    output_shapes = []
+    all_values = set()
+
+    for problem_set in train_ds['train']:
+        for problem in problem_set:
+            input_matrix = problem['input']
+            target_matrix = problem['output']
+            # Collect input and output grid shapes
+            input_shapes.append((len(input_matrix), len(input_matrix[0]) if input_matrix else 0))
+            output_shapes.append((len(target_matrix), len(target_matrix[0]) if target_matrix else 0))
+            # Collect all unique values in input and output
+            for row in input_matrix:
+                all_values.update(row)
+            for row in target_matrix:
+                all_values.update(row)
+
+    # Compute statistics for input and output grids
+    def get_stats(shapes: list[tuple[int, int]]) -> tuple[float, int, int]:
+        sizes = [h * w for h, w in shapes]
+        if not sizes:
+            raise ValueError("No grid sizes found for statistics.")
+        avg_size = sum(sizes) / len(sizes)
+        min_size = min(sizes)
+        max_size = max(sizes)
+        return avg_size, min_size, max_size
+
+    input_avg, input_min, input_max = get_stats(input_shapes)
+    output_avg, output_min, output_max = get_stats(output_shapes)
+
+    print(f"Input grid sizes: avg={input_avg:.2f}, min={input_min}, max={input_max}")
+    print(f"Output grid sizes: avg={output_avg:.2f}, min={output_min}, max={output_max}")
+    print(f"Possible values in grids: {sorted(all_values)}")
+    # Loss and optimizer - use MSE for pixel-level reconstruction
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
     
     # Train the model
-    train_model(model, train_loader, optimizer, criterion, epochs=10, device=device)
+    train_model_arcagi(model, optimizer, criterion, epochs=10, device=device)
     
     # Save the model
     torch.save(model.state_dict(), 'ctm_model.pth')
     print('Model saved to ctm_model.pth')
+    mlflow.end_run()
 
 
 if __name__ == '__main__':
     main()
+
