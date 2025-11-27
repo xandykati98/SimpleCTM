@@ -9,6 +9,29 @@ import numpy as np
 from dataclasses import dataclass, field
 import argparse
 import math
+import os
+
+# MLflow for experiment tracking
+import mlflow
+import mlflow.pytorch
+
+# Modal support for cloud GPU training
+import modal
+
+# Modal app configuration
+modal_app = modal.App("gated-ctm-training")
+
+# Modal image with required dependencies
+modal_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch>=2.0.0",
+        "torchvision>=0.15.0",
+        "matplotlib",
+        "numpy",
+        "mlflow",
+    )
+)
 
 
 # Task configuration
@@ -612,7 +635,9 @@ def train_multitask_gated_model(
     epochs: int, 
     device: torch.device,
     task_names: list[str],
-    task_index_mapping: dict[int, int]
+    task_index_mapping: dict[int, int],
+    test_dataset: Dataset,
+    output_folder: str,
 ) -> TrainingMetrics:
     """
     Training loop for MultitaskGatedCTM on combined multi-dataset.
@@ -696,12 +721,77 @@ def train_multitask_gated_model(
                 avg_balance = batch_balance_loss.item() / max(1, sum(1 for d in dataset_task_indices if stacked_images[d] is not None))
                 print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
                       f'Total Loss: {total_loss.item():.4f}, Balance: {avg_balance:.4f}')
+            
+            # Gate inspection at batch 100
+            if batch_idx == 100:
+                print('\n' + '='*60)
+                print('GATE INSPECTION AT BATCH 100')
+                print('='*60)
+                model.eval()
+                with torch.no_grad():
+                    # Find first available data for inspection
+                    for dataset_name, task_indices in dataset_task_indices.items():
+                        data = stacked_images.get(dataset_name)
+                        if data is not None:
+                            for original_idx in task_indices:
+                                if original_idx in task_index_mapping:
+                                    model_task_idx = task_index_mapping[original_idx]
+                                    task_name = task_names[model_task_idx]
+                                    
+                                    # Forward with tracking to get gate weights
+                                    results = model(data[:8].to(device), task_idx=model_task_idx, track=True)
+                                    predictions, certainties, lb_loss, syncs, pre_acts, post_acts, attn, gates = results
+                                    gate_action, gate_out = gates
+                                    
+                                    # gate_action shape: (ticks, batch, n_sets)
+                                    # Average over batch, show per tick
+                                    avg_gate_action = gate_action.mean(axis=1)  # (ticks, n_sets)
+                                    avg_gate_out = gate_out.mean(axis=1)
+                                    
+                                    print(f'\nTask: {task_name}')
+                                    print(f'Action Gate Weights (avg over batch, first/mid/last tick):')
+                                    print(f'  Tick 0:  {avg_gate_action[0]}')
+                                    print(f'  Tick 7:  {avg_gate_action[7]}')
+                                    print(f'  Tick 14: {avg_gate_action[14]}')
+                                    print(f'Output Gate Weights (avg over batch, first/mid/last tick):')
+                                    print(f'  Tick 0:  {avg_gate_out[0]}')
+                                    print(f'  Tick 7:  {avg_gate_out[7]}')
+                                    print(f'  Tick 14: {avg_gate_out[14]}')
+                                    
+                                    # Per-sample variance to see if gates differentiate across inputs
+                                    sample_var_action = gate_action[-1].var(axis=0)  # variance across batch at last tick
+                                    sample_var_out = gate_out[-1].var(axis=0)
+                                    print(f'Gate variance across samples (last tick):')
+                                    print(f'  Action: {sample_var_action}')
+                                    print(f'  Output: {sample_var_out}')
+                                    
+                                    # Log gate weights to MLflow
+                                    for set_idx in range(avg_gate_out.shape[1]):
+                                        mlflow.log_metric(f"gate_out_set{set_idx}_tick14", float(avg_gate_out[14, set_idx]), step=epoch + 1)
+                                        mlflow.log_metric(f"gate_action_set{set_idx}_tick14", float(avg_gate_action[14, set_idx]), step=epoch + 1)
+                                    mlflow.log_metric("gate_out_variance", float(sample_var_out.mean()), step=epoch + 1)
+                                    mlflow.log_metric("gate_action_variance", float(sample_var_action.mean()), step=epoch + 1)
+                                    
+                                    # Performance on this batch
+                                    target = torch.tensor([labels[original_task_names[original_idx]][i] for i in batch_indices[dataset_name][:8]]).to(device)
+                                    final_preds = predictions[..., -1]
+                                    _, predicted = torch.max(final_preds, 1)
+                                    correct = (predicted == target).sum().item()
+                                    print(f'Batch accuracy: {correct}/8 = {100*correct/8:.1f}%')
+                                    break
+                            break
+                print('='*60 + '\n')
+                model.train()
         
         avg_balance = total_balance_loss / max(1, balance_count)
         metrics.epoch_balance_losses.append(avg_balance)
         
         print(f'\n=== Epoch {epoch+1}/{epochs} Summary ===')
         print(f'  Average Balance Loss: {avg_balance:.4f}')
+        
+        # Log epoch-level metrics to MLflow
+        mlflow.log_metric("balance_loss", avg_balance, step=epoch + 1)
+        
         for task_name in task_names:
             if task_total[task_name] > 0:
                 accuracy = 100. * task_correct[task_name] / task_total[task_name]
@@ -709,6 +799,22 @@ def train_multitask_gated_model(
                 metrics.epoch_losses[task_name].append(avg_loss)
                 metrics.epoch_accuracies[task_name].append(accuracy)
                 print(f'  {task_name}: Loss={avg_loss:.4f}, Accuracy={accuracy:.2f}%')
+                
+                # Log per-task metrics to MLflow
+                mlflow.log_metric(f"{task_name}/train_loss", avg_loss, step=epoch + 1)
+                mlflow.log_metric(f"{task_name}/train_accuracy", accuracy, step=epoch + 1)
+        
+        # Generate neural dynamics plots for all tasks at end of each epoch
+        generate_epoch_plots(
+            model=model,
+            test_dataset=test_dataset,
+            task_names=task_names,
+            task_index_mapping=task_index_mapping,
+            device=device,
+            output_folder=output_folder,
+            epoch=epoch + 1,
+        )
+        model.train()
         print()
     
     return metrics
@@ -790,13 +896,144 @@ def get_neural_dynamics(
     return post_history, {'out': syncs[0], 'action': syncs[1]}, gates
 
 
+def plot_neural_dynamics_for_task(
+    model: MultitaskGatedCTM,
+    sample_image: torch.Tensor,
+    task_idx: int,
+    task_name: str,
+    device: torch.device,
+    output_path: str,
+    epoch: int,
+):
+    """Generate neural dynamics plot for a single task."""
+    model.eval()
+    with torch.no_grad():
+        post_history, task_syncs, gates = get_neural_dynamics(
+            model, sample_image.unsqueeze(0), task_idx=task_idx, device=device
+        )
+    gate_action, gate_out = gates
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Neural Dynamics - {task_name} (Epoch {epoch})', fontsize=14, fontweight='bold')
+    
+    # Input image
+    ax_img = axes[0, 0]
+    img_np = sample_image.cpu().numpy()
+    if img_np.shape[0] == 3:
+        mean = np.array([0.4914, 0.4822, 0.4465]).reshape(3, 1, 1)
+        std = np.array([0.2470, 0.2435, 0.2616]).reshape(3, 1, 1)
+        img_np = img_np * std + mean
+        img_np = np.clip(img_np, 0, 1)
+        img_np = np.transpose(img_np, (1, 2, 0))
+        ax_img.imshow(img_np)
+    else:
+        img_np = img_np * 0.3081 + 0.1307
+        img_np = np.clip(img_np, 0, 1)
+        ax_img.imshow(img_np.squeeze(), cmap='gray')
+    ax_img.set_title(f'Input Image ({task_name})')
+    ax_img.axis('off')
+    
+    # Post-activation dynamics
+    ax_activity = axes[0, 1]
+    activity_data = post_history[0].numpy()
+    im = ax_activity.imshow(activity_data, aspect='auto', cmap='RdBu_r', interpolation='nearest')
+    ax_activity.set_xlabel('Tick')
+    ax_activity.set_ylabel('Neuron')
+    ax_activity.set_title('Post-Activation Dynamics')
+    plt.colorbar(im, ax=ax_activity, label='Activation')
+    
+    # Action gate weights
+    ax_gate_action = axes[1, 0]
+    gate_action_data = gate_action[:, 0, :]
+    for set_idx in range(gate_action_data.shape[1]):
+        ax_gate_action.plot(gate_action_data[:, set_idx], label=f'Set {set_idx}', alpha=0.8)
+    ax_gate_action.set_xlabel('Tick')
+    ax_gate_action.set_ylabel('Gate Weight')
+    ax_gate_action.set_title('Action Gate Weights Over Ticks')
+    ax_gate_action.legend()
+    ax_gate_action.grid(True, alpha=0.3)
+    ax_gate_action.set_ylim([0, 1])
+    
+    # Output gate weights
+    ax_gate_out = axes[1, 1]
+    gate_out_data = gate_out[:, 0, :]
+    for set_idx in range(gate_out_data.shape[1]):
+        ax_gate_out.plot(gate_out_data[:, set_idx], label=f'Set {set_idx}', alpha=0.8)
+    ax_gate_out.set_xlabel('Tick')
+    ax_gate_out.set_ylabel('Gate Weight')
+    ax_gate_out.set_title('Output Gate Weights Over Ticks')
+    ax_gate_out.legend()
+    ax_gate_out.grid(True, alpha=0.3)
+    ax_gate_out.set_ylim([0, 1])
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def generate_epoch_plots(
+    model: MultitaskGatedCTM,
+    test_dataset: Dataset,
+    task_names: list[str],
+    task_index_mapping: dict[int, int],
+    device: torch.device,
+    output_folder: str,
+    epoch: int,
+):
+    """Generate neural dynamics plots for all tasks at end of epoch."""
+    all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+    
+    # Get sample images for each task from test dataset
+    task_samples: dict[str, torch.Tensor] = {}
+    
+    for idx in range(len(test_dataset)):
+        image, labels, source = test_dataset[idx]
+        
+        for task_name in task_names:
+            if task_name in task_samples:
+                continue
+            
+            original_idx = all_task_order.index(task_name)
+            label_key = all_task_order[original_idx]
+            
+            if labels.get(label_key, -1) >= 0:
+                task_samples[task_name] = image
+        
+        if len(task_samples) == len(task_names):
+            break
+    
+    # Generate plot for each task
+    model.eval()
+    for task_name in task_names:
+        if task_name not in task_samples:
+            continue
+        
+        sample_image = task_samples[task_name]
+        original_idx = all_task_order.index(task_name)
+        model_task_idx = task_index_mapping[original_idx]
+        
+        output_path = os.path.join(output_folder, f'epoch{epoch:02d}_{task_name}_dynamics.png')
+        plot_neural_dynamics_for_task(
+            model=model,
+            sample_image=sample_image,
+            task_idx=model_task_idx,
+            task_name=task_name,
+            device=device,
+            output_path=output_path,
+            epoch=epoch,
+        )
+    
+    print(f'  Saved neural dynamics plots for epoch {epoch} to {output_folder}')
+
+
 def plot_training_results(
     metrics: TrainingMetrics,
     test_accuracies: dict[str, float],
     model: MultitaskGatedCTM,
-    sample_image: torch.Tensor,
+    test_dataset: Dataset,
+    task_index_mapping: dict[int, int],
     device: torch.device,
-    output_prefix: str
+    output_folder: str,
 ):
     """Generate comprehensive training visualization plots."""
     task_names = metrics.task_names
@@ -833,7 +1070,8 @@ def plot_training_results(
     ax_acc.set_ylim([0, 105])
     
     plt.tight_layout()
-    fig1.savefig(f'{output_prefix}_fig1_training_curves.png', dpi=150, bbox_inches='tight')
+    fig1.savefig(os.path.join(output_folder, 'fig1_training_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig1)
     
     # Figure 2: Batch-level Loss + Balance Loss
     fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
@@ -864,67 +1102,12 @@ def plot_training_results(
     ax_balance.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    fig2.savefig(f'{output_prefix}_fig2_batch_losses.png', dpi=150, bbox_inches='tight')
+    fig2.savefig(os.path.join(output_folder, 'fig2_batch_losses.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig2)
     
-    # Figure 3: Neural Dynamics + Gate Weights
-    post_history, task_syncs, gates = get_neural_dynamics(model, sample_image.unsqueeze(0), task_idx=0, device=device)
-    gate_action, gate_out = gates
-    
-    fig3, axes3 = plt.subplots(2, 2, figsize=(14, 10))
-    fig3.suptitle('Neural Dynamics & Gating Visualization (Gated CTM)', fontsize=14, fontweight='bold')
-    
-    ax_img = axes3[0, 0]
-    img_np = sample_image.cpu().numpy()
-    if img_np.shape[0] == 3:
-        mean = np.array([0.4914, 0.4822, 0.4465]).reshape(3, 1, 1)
-        std = np.array([0.2470, 0.2435, 0.2616]).reshape(3, 1, 1)
-        img_np = img_np * std + mean
-        img_np = np.clip(img_np, 0, 1)
-        img_np = np.transpose(img_np, (1, 2, 0))
-        ax_img.imshow(img_np)
-    else:
-        img_np = img_np * 0.3081 + 0.1307
-        img_np = np.clip(img_np, 0, 1)
-        ax_img.imshow(img_np.squeeze(), cmap='gray')
-    ax_img.set_title('Input Image')
-    ax_img.axis('off')
-    
-    ax_activity = axes3[0, 1]
-    activity_data = post_history[0].numpy()
-    im = ax_activity.imshow(activity_data, aspect='auto', cmap='RdBu_r', interpolation='nearest')
-    ax_activity.set_xlabel('Tick')
-    ax_activity.set_ylabel('Neuron')
-    ax_activity.set_title('Post-Activation Dynamics')
-    plt.colorbar(im, ax=ax_activity, label='Activation')
-    
-    ax_gate_action = axes3[1, 0]
-    gate_action_data = gate_action[:, 0, :]  # (ticks, n_sync_sets)
-    for set_idx in range(gate_action_data.shape[1]):
-        ax_gate_action.plot(gate_action_data[:, set_idx], label=f'Set {set_idx}', alpha=0.8)
-    ax_gate_action.set_xlabel('Tick')
-    ax_gate_action.set_ylabel('Gate Weight')
-    ax_gate_action.set_title('Action Gate Weights Over Ticks')
-    ax_gate_action.legend()
-    ax_gate_action.grid(True, alpha=0.3)
-    ax_gate_action.set_ylim([0, 1])
-    
-    ax_gate_out = axes3[1, 1]
-    gate_out_data = gate_out[:, 0, :]  # (ticks, n_sync_sets)
-    for set_idx in range(gate_out_data.shape[1]):
-        ax_gate_out.plot(gate_out_data[:, set_idx], label=f'Set {set_idx}', alpha=0.8)
-    ax_gate_out.set_xlabel('Tick')
-    ax_gate_out.set_ylabel('Gate Weight')
-    ax_gate_out.set_title('Output Gate Weights Over Ticks')
-    ax_gate_out.legend()
-    ax_gate_out.grid(True, alpha=0.3)
-    ax_gate_out.set_ylim([0, 1])
-    
-    plt.tight_layout()
-    fig3.savefig(f'{output_prefix}_fig3_neural_dynamics.png', dpi=150, bbox_inches='tight')
-    
-    # Figure 4: Final Accuracy
-    fig4, ax4 = plt.subplots(figsize=(10, 6))
-    fig4.suptitle('Final Model Performance (Gated CTM)', fontsize=14, fontweight='bold')
+    # Figure 3: Final Accuracy
+    fig3, ax3 = plt.subplots(figsize=(10, 6))
+    fig3.suptitle('Final Model Performance (Gated CTM)', fontsize=14, fontweight='bold')
     
     x = np.arange(len(task_names))
     width = 0.35
@@ -932,36 +1115,34 @@ def plot_training_results(
     train_accs = [metrics.epoch_accuracies[name][-1] if metrics.epoch_accuracies[name] else 0 for name in task_names]
     test_accs = [test_accuracies.get(name, 0) for name in task_names]
     
-    bars1 = ax4.bar(x - width/2, train_accs, width, label='Train', color='#3498db', alpha=0.8)
-    bars2 = ax4.bar(x + width/2, test_accs, width, label='Test', color='#9b59b6', alpha=0.8)
+    bars1 = ax3.bar(x - width/2, train_accs, width, label='Train', color='#3498db', alpha=0.8)
+    bars2 = ax3.bar(x + width/2, test_accs, width, label='Test', color='#9b59b6', alpha=0.8)
     
-    ax4.set_xlabel('Task')
-    ax4.set_ylabel('Accuracy (%)')
-    ax4.set_xticks(x)
-    ax4.set_xticklabels([name.replace('_', '\n') for name in task_names], fontsize=9)
-    ax4.legend()
-    ax4.set_ylim([0, 105])
-    ax4.grid(True, alpha=0.3, axis='y')
+    ax3.set_xlabel('Task')
+    ax3.set_ylabel('Accuracy (%)')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels([name.replace('_', '\n') for name in task_names], fontsize=9)
+    ax3.legend()
+    ax3.set_ylim([0, 105])
+    ax3.grid(True, alpha=0.3, axis='y')
     
     for bars in [bars1, bars2]:
         for bar in bars:
             height = bar.get_height()
             if height > 0:
-                ax4.annotate(f'{height:.1f}%',
+                ax3.annotate(f'{height:.1f}%',
                             xy=(bar.get_x() + bar.get_width()/2, height),
                             xytext=(0, 3), textcoords='offset points',
                             ha='center', va='bottom', fontsize=8)
     
     plt.tight_layout()
-    fig4.savefig(f'{output_prefix}_fig4_final_accuracy.png', dpi=150, bbox_inches='tight')
+    fig3.savefig(os.path.join(output_folder, 'fig3_final_accuracy.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig3)
     
-    plt.show()
-    
-    print(f'\nPlots saved with prefix "{output_prefix}":')
-    print(f'  - {output_prefix}_fig1_training_curves.png')
-    print(f'  - {output_prefix}_fig2_batch_losses.png')
-    print(f'  - {output_prefix}_fig3_neural_dynamics.png')
-    print(f'  - {output_prefix}_fig4_final_accuracy.png')
+    print(f'\nFinal plots saved to {output_folder}:')
+    print(f'  - fig1_training_curves.png')
+    print(f'  - fig2_batch_losses.png')
+    print(f'  - fig3_final_accuracy.png')
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -1009,109 +1190,284 @@ def print_model_info(model: MultitaskGatedCTM):
     print(f'================================================\n')
 
 
-def train_combined(device: torch.device, selected_tasks: list[str], epochs: int, n_neurons: int, n_sync_sets: int):
+def train_combined(
+    device: torch.device, 
+    selected_tasks: list[str], 
+    epochs: int, 
+    n_neurons: int, 
+    n_sync_sets: int,
+    data_dir: str = './data',
+    output_dir: str = '.',
+) -> tuple:
     """Train MultitaskGatedCTM on selected tasks."""
     print('\n' + '='*60)
     print(f'TRAINING GATED CTM ON TASKS: {", ".join(selected_tasks)}')
     print('='*60)
     
-    needs_mnist = any(ALL_TASKS[t]['dataset'] == 'mnist' for t in selected_tasks)
-    needs_cifar = any(ALL_TASKS[t]['dataset'] == 'cifar' for t in selected_tasks)
-    needs_fashion = any(ALL_TASKS[t]['dataset'] == 'fashion' for t in selected_tasks)
-    needs_emnist = any(ALL_TASKS[t]['dataset'] == 'emnist' for t in selected_tasks)
-    
-    mnist_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    
-    cifar_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-    ])
-    
-    mnist_train = mnist_test = None
-    cifar_train = cifar_test = None
-    fashion_train = fashion_test = None
-    emnist_train = emnist_test = None
-    
-    if needs_mnist:
-        mnist_train = datasets.MNIST(root='./data', train=True, download=True, transform=mnist_transform)
-        mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=mnist_transform)
-    
-    if needs_cifar:
-        cifar_train = datasets.CIFAR10(root='./data', train=True, download=True, transform=cifar_transform)
-        cifar_test = datasets.CIFAR10(root='./data', train=False, download=True, transform=cifar_transform)
-    
-    if needs_fashion:
-        fashion_train = datasets.FashionMNIST(root='./data', train=True, download=True, transform=mnist_transform)
-        fashion_test = datasets.FashionMNIST(root='./data', train=False, download=True, transform=mnist_transform)
-    
-    if needs_emnist:
-        emnist_train = datasets.EMNIST(root='./data', split='balanced', train=True, download=True, transform=mnist_transform)
-        emnist_test = datasets.EMNIST(root='./data', split='balanced', train=False, download=True, transform=mnist_transform)
-    
-    train_dataset = CombinedMultitaskDataset(mnist_train, cifar_train, fashion_train, emnist_train)
-    test_dataset = CombinedMultitaskDataset(mnist_test, cifar_test, fashion_test, emnist_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate_fn)
-    
-    all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
-    task_names = selected_tasks
-    task_output_sizes = [ALL_TASKS[t]['output_size'] for t in selected_tasks]
-    
-    task_index_mapping = {}
-    for new_idx, task_name in enumerate(selected_tasks):
-        original_idx = all_task_order.index(task_name)
-        task_index_mapping[original_idx] = new_idx
-    
-    print(f'Task configuration:')
-    for i, task_name in enumerate(task_names):
-        print(f'  Task {i}: {task_name} ({ALL_TASKS[task_name]["description"]})')
-    
-    model = MultitaskGatedCTM(
-        n_neurons=n_neurons,
-        max_memory=10, 
-        max_ticks=15, 
-        n_representation_size=32,
-        n_synch_out=32,
-        n_synch_action=16,
-        n_attention_heads=4,
-        task_output_sizes=task_output_sizes,
-        n_sync_sets=n_sync_sets,
-        load_balance_coef=0.01,
-    ).to(device)
-    
-    print_model_info(model)
-    
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    metrics = train_multitask_gated_model(
-        model, train_loader, optimizer, 
-        epochs=epochs, device=device, task_names=task_names,
-        task_index_mapping=task_index_mapping
-    )
-    
-    test_accuracies = evaluate_multitask_gated_model(
-        model, test_loader, device=device, task_names=task_names,
-        task_index_mapping=task_index_mapping
-    )
-    
+    # Create output folder for plots
     output_prefix = '_'.join([t.split('_')[0][0] + t.split('_')[1][0] for t in selected_tasks]) + '_gated'
+    output_folder = os.path.join(output_dir, output_prefix + '_plots')
+    os.makedirs(output_folder, exist_ok=True)
+    print(f'Output folder: {output_folder}')
     
-    torch.save(model.state_dict(), f'{output_prefix}_multitask_ctm.pth')
-    print(f'Model saved to {output_prefix}_multitask_ctm.pth')
+    # Set MLflow tracking URI to output folder
+    mlflow_dir = os.path.join(output_folder, 'mlruns')
+    mlflow.set_tracking_uri(f'file://{os.path.abspath(mlflow_dir)}')
+    mlflow.set_experiment("gated_ctm")
     
-    sample_image, _, _ = test_dataset[0]
-    
-    print('\nGenerating training plots...')
-    plot_training_results(
-        metrics, test_accuracies, model, sample_image, device,
-        output_prefix=output_prefix
-    )
+    # Start MLflow run
+    with mlflow.start_run(run_name=output_prefix):
+        # Log hyperparameters
+        mlflow.log_params({
+            "tasks": ",".join(selected_tasks),
+            "n_tasks": len(selected_tasks),
+            "epochs": epochs,
+            "n_neurons": n_neurons,
+            "n_sync_sets": n_sync_sets,
+            "max_memory": 10,
+            "max_ticks": 15,
+            "n_representation_size": 32,
+            "n_synch_out": 32,
+            "n_synch_action": 16,
+            "n_attention_heads": 4,
+            "load_balance_coef": 0.0,
+            "learning_rate": 0.001,
+            "batch_size": 16,
+        })
+        
+        needs_mnist = any(ALL_TASKS[t]['dataset'] == 'mnist' for t in selected_tasks)
+        needs_cifar = any(ALL_TASKS[t]['dataset'] == 'cifar' for t in selected_tasks)
+        needs_fashion = any(ALL_TASKS[t]['dataset'] == 'fashion' for t in selected_tasks)
+        needs_emnist = any(ALL_TASKS[t]['dataset'] == 'emnist' for t in selected_tasks)
+        
+        mnist_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        
+        cifar_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+        ])
+        
+        mnist_train = mnist_test = None
+        cifar_train = cifar_test = None
+        fashion_train = fashion_test = None
+        emnist_train = emnist_test = None
+        
+        if needs_mnist:
+            mnist_train = datasets.MNIST(root=data_dir, train=True, download=True, transform=mnist_transform)
+            mnist_test = datasets.MNIST(root=data_dir, train=False, download=True, transform=mnist_transform)
+        
+        if needs_cifar:
+            cifar_train = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=cifar_transform)
+            cifar_test = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=cifar_transform)
+        
+        if needs_fashion:
+            fashion_train = datasets.FashionMNIST(root=data_dir, train=True, download=True, transform=mnist_transform)
+            fashion_test = datasets.FashionMNIST(root=data_dir, train=False, download=True, transform=mnist_transform)
+        
+        if needs_emnist:
+            emnist_train = datasets.EMNIST(root=data_dir, split='balanced', train=True, download=True, transform=mnist_transform)
+            emnist_test = datasets.EMNIST(root=data_dir, split='balanced', train=False, download=True, transform=mnist_transform)
+        
+        train_dataset = CombinedMultitaskDataset(mnist_train, cifar_train, fashion_train, emnist_train)
+        test_dataset = CombinedMultitaskDataset(mnist_test, cifar_test, fashion_test, emnist_test)
+        
+        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, collate_fn=custom_collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate_fn)
+        
+        all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+        task_names = selected_tasks
+        task_output_sizes = [ALL_TASKS[t]['output_size'] for t in selected_tasks]
+        
+        task_index_mapping = {}
+        for new_idx, task_name in enumerate(selected_tasks):
+            original_idx = all_task_order.index(task_name)
+            task_index_mapping[original_idx] = new_idx
+        
+        print(f'Task configuration:')
+        for i, task_name in enumerate(task_names):
+            print(f'  Task {i}: {task_name} ({ALL_TASKS[task_name]["description"]})')
+        
+        model = MultitaskGatedCTM(
+            n_neurons=n_neurons,
+            max_memory=10, 
+            max_ticks=15, 
+            n_representation_size=32,
+            n_synch_out=32,
+            n_synch_action=16,
+            n_attention_heads=4,
+            task_output_sizes=task_output_sizes,
+            n_sync_sets=n_sync_sets,
+            load_balance_coef=0.0,  # Disabled to test if gates differentiate without balance pressure
+        ).to(device)
+        
+        # Log model parameter count
+        total_params = count_parameters(model)
+        mlflow.log_param("total_parameters", total_params)
+        
+        print_model_info(model)
+        
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        metrics = train_multitask_gated_model(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            epochs=epochs,
+            device=device,
+            task_names=task_names,
+            task_index_mapping=task_index_mapping,
+            test_dataset=test_dataset,
+            output_folder=output_folder,
+        )
+        
+        test_accuracies = evaluate_multitask_gated_model(
+            model, test_loader, device=device, task_names=task_names,
+            task_index_mapping=task_index_mapping
+        )
+        
+        # Log test accuracies
+        for task_name, accuracy in test_accuracies.items():
+            mlflow.log_metric(f"{task_name}/test_accuracy", accuracy)
+        
+        # Log average test accuracy
+        avg_test_accuracy = sum(test_accuracies.values()) / len(test_accuracies)
+        mlflow.log_metric("avg_test_accuracy", avg_test_accuracy)
+        
+        model_path = os.path.join(output_folder, 'multitask_ctm.pth')
+        torch.save(model.state_dict(), model_path)
+        print(f'Model saved to {model_path}')
+        
+        # Log model artifact
+        mlflow.log_artifact(model_path)
+        
+        print('\nGenerating final training plots...')
+        plot_training_results(
+            metrics=metrics,
+            test_accuracies=test_accuracies,
+            model=model,
+            test_dataset=test_dataset,
+            task_index_mapping=task_index_mapping,
+            device=device,
+            output_folder=output_folder,
+        )
+        
+        # Log plot artifacts
+        for plot_file in ['fig1_training_curves.png', 'fig2_batch_losses.png', 'fig3_final_accuracy.png']:
+            plot_path = os.path.join(output_folder, plot_file)
+            if os.path.exists(plot_path):
+                mlflow.log_artifact(plot_path)
+        
+        print(f'\nMLflow tracking URI: {mlflow.get_tracking_uri()}')
+        print(f'MLflow run ID: {mlflow.active_run().info.run_id}')
     
     return model, metrics, test_accuracies
+
+
+@modal_app.function(
+    image=modal_image,
+    gpu="T4",
+    timeout=36000,
+    volumes={"/data": modal.Volume.from_name("ctm-data", create_if_missing=True)},
+)
+def train_on_modal(
+    selected_tasks: list[str],
+    epochs: int,
+    n_neurons: int,
+    n_sync_sets: int,
+) -> dict:
+    """
+    Modal GPU training function.
+    Runs training on Modal's cloud infrastructure with GPU support.
+    
+    Returns training metrics and test accuracies.
+    """
+    import torch
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Modal training started on device: {device}')
+    print(f'CUDA available: {torch.cuda.is_available()}')
+    if torch.cuda.is_available():
+        print(f'GPU: {torch.cuda.get_device_name(0)}')
+    
+    # Use Modal volume for data persistence
+    data_dir = '/data/datasets'
+    output_dir = '/data/outputs'
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    model, metrics, test_accuracies = train_combined(
+        device=device,
+        selected_tasks=selected_tasks,
+        epochs=epochs,
+        n_neurons=n_neurons,
+        n_sync_sets=n_sync_sets,
+        data_dir=data_dir,
+        output_dir=output_dir,
+    )
+    
+    # Return serializable results
+    return {
+        'test_accuracies': test_accuracies,
+        'final_train_accuracies': {
+            name: metrics.epoch_accuracies[name][-1] 
+            for name in metrics.task_names 
+            if metrics.epoch_accuracies[name]
+        },
+        'tasks': selected_tasks,
+        'epochs': epochs,
+        'n_neurons': n_neurons,
+        'n_sync_sets': n_sync_sets,
+    }
+
+
+@modal_app.local_entrypoint()
+def modal_entrypoint(
+    tasks: str = "fashion_fine,emnist_fine,cifar_fine",
+    epochs: int = 5,
+    neurons: int = 64,
+    sync_sets: int = 4,
+):
+    """
+    Modal entrypoint for running training from command line.
+    
+    Usage:
+        modal run ctm_extended.py --tasks "fashion_fine,cifar_fine" --epochs 10
+    """
+    selected_tasks = [t.strip() for t in tasks.split(',')]
+    
+    # Validate tasks
+    for task in selected_tasks:
+        if task not in ALL_TASKS:
+            raise ValueError(f"Unknown task: {task}. Available: {list(ALL_TASKS.keys())}")
+    
+    print(f'\n{"="*60}')
+    print('STARTING MODAL GPU TRAINING')
+    print(f'{"="*60}')
+    print(f'Tasks: {", ".join(selected_tasks)}')
+    print(f'Epochs: {epochs}')
+    print(f'Neurons: {neurons}')
+    print(f'Sync sets: {sync_sets}')
+    print(f'{"="*60}\n')
+    
+    # Run training on Modal GPU
+    results = train_on_modal.remote(
+        selected_tasks=selected_tasks,
+        epochs=epochs,
+        n_neurons=neurons,
+        n_sync_sets=sync_sets,
+    )
+    
+    print(f'\n{"="*60}')
+    print('MODAL TRAINING COMPLETE')
+    print(f'{"="*60}')
+    print('\nResults:')
+    for task, acc in results['test_accuracies'].items():
+        print(f'  {task}: {acc:.2f}%')
+    
+    return results
 
 
 def main():
@@ -1128,10 +1484,14 @@ Available tasks:
   fashion_fine     - Fashion MNIST classification (10 classes)
   emnist_fine      - EMNIST balanced classification (47 classes)
 
-Examples:
+Examples (local):
   py ctm_extended.py --tasks fashion_fine emnist_fine cifar_fine
   py ctm_extended.py --tasks mnist_digit cifar_fine --sync_sets 8
   py ctm_extended.py --tasks fashion_fine emnist_fine cifar_fine --epochs 10 --neurons 64
+
+Examples (Modal cloud GPU):
+  modal run ctm_extended.py --tasks "fashion_fine,cifar_fine" --epochs 10
+  modal run ctm_extended.py --tasks "mnist_digit,cifar_fine" --neurons 128
         """
     )
     
@@ -1164,6 +1524,20 @@ Examples:
         help='Number of synchronization pair sets (default: 4)'
     )
     
+    parser.add_argument(
+        '--modal',
+        action='store_true',
+        help='Run training on Modal cloud GPU instead of local'
+    )
+    
+    parser.add_argument(
+        '--gpu',
+        type=str,
+        default='T4',
+        choices=['T4', 'A10G', 'A100', 'H100'],
+        help='Modal GPU type (default: T4). Only used with --modal flag'
+    )
+    
     args = parser.parse_args()
     
     if not args.tasks:
@@ -1174,14 +1548,48 @@ Examples:
         print("Error: Duplicate tasks detected")
         return
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    print(f'Selected tasks: {", ".join(args.tasks)}')
-    print(f'Epochs: {args.epochs}')
-    print(f'Neurons: {args.neurons}')
-    print(f'Sync sets: {args.sync_sets}')
-    
-    train_combined(device, args.tasks, args.epochs, args.neurons, args.sync_sets)
+    if args.modal:
+        # Run on Modal cloud
+        print(f'\n{"="*60}')
+        print('RUNNING ON MODAL CLOUD GPU')
+        print(f'{"="*60}')
+        print(f'GPU type: {args.gpu}')
+        print(f'Selected tasks: {", ".join(args.tasks)}')
+        print(f'Epochs: {args.epochs}')
+        print(f'Neurons: {args.neurons}')
+        print(f'Sync sets: {args.sync_sets}')
+        
+        # Dynamically update GPU type if different from default
+        with modal_app.run():
+            results = train_on_modal.remote(
+                selected_tasks=args.tasks,
+                epochs=args.epochs,
+                n_neurons=args.neurons,
+                n_sync_sets=args.sync_sets,
+            )
+        
+        print(f'\n{"="*60}')
+        print('MODAL TRAINING COMPLETE')
+        print(f'{"="*60}')
+        print('\nResults:')
+        for task, acc in results['test_accuracies'].items():
+            print(f'  {task}: {acc:.2f}%')
+    else:
+        # Run locally
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {device}')
+        print(f'Selected tasks: {", ".join(args.tasks)}')
+        print(f'Epochs: {args.epochs}')
+        print(f'Neurons: {args.neurons}')
+        print(f'Sync sets: {args.sync_sets}')
+        
+        train_combined(
+            device=device, 
+            selected_tasks=args.tasks, 
+            epochs=args.epochs, 
+            n_neurons=args.neurons, 
+            n_sync_sets=args.sync_sets,
+        )
     
     print('\n' + '='*60)
     print('TRAINING COMPLETE')
