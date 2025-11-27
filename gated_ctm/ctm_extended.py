@@ -10,10 +10,24 @@ from dataclasses import dataclass, field
 import argparse
 import math
 import os
+import contextlib
+import wave
+
+# Audio processing
+import torchaudio
+from torchaudio.transforms import MelSpectrogram, Resample
+
+# Tabular data
+from sklearn.datasets import load_wine
 
 # MLflow for experiment tracking
 import mlflow
 import mlflow.pytorch
+import logging
+
+# Suppress verbose logging from MLflow and Alembic
+logging.getLogger("mlflow").setLevel(logging.ERROR)
+logging.getLogger("alembic").setLevel(logging.ERROR)
 
 # Modal support for cloud GPU training
 import modal
@@ -24,24 +38,80 @@ modal_app = modal.App("gated-ctm-training")
 # Modal image with required dependencies
 modal_image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libsndfile1", "ffmpeg")  # Required for torchaudio
     .pip_install(
         "torch>=2.0.0",
         "torchvision>=0.15.0",
+        "torchaudio>=2.0.0",
         "matplotlib",
         "numpy",
         "mlflow",
+        "scikit-learn",
+        "torchcodec"
     )
 )
 
 
+def _load_wav_with_stdlib(path: str) -> tuple[torch.Tensor, int]:
+    """
+    Minimal WAV loader using Python stdlib.
+
+    This is used as a fallback when torchaudio has no compiled audio backends
+    (common on unsupported Python versions), so that SpeechCommands can still
+    be loaded.
+    """
+    with contextlib.closing(wave.open(path, "rb")) as wf:
+        num_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        num_frames = wf.getnframes()
+        frames = wf.readframes(num_frames)
+
+    # Speech Commands uses 16‑bit PCM WAV; enforce that here
+    if sample_width != 2:
+        raise RuntimeError(f"Unsupported WAV sample width ({8 * sample_width} bits) in file: {path}")
+
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+    if num_channels > 1:
+        audio = audio.reshape(-1, num_channels).T  # (C, T)
+    else:
+        audio = audio[None, :]  # (1, T)
+
+    waveform = torch.from_numpy(audio)
+    return waveform, sample_rate
+
+
+def _maybe_patch_torchaudio_load() -> None:
+    """
+    If torchaudio reports no available audio backends, patch torchaudio.load
+    to use a simple WAV loader so that datasets.SPEECHCOMMANDS works locally.
+    """
+    try:
+        backends = torchaudio.list_audio_backends()
+    except Exception:
+        backends = []
+
+    if len(backends) == 0:
+        torchaudio.load = _load_wav_with_stdlib
+
+
+_maybe_patch_torchaudio_load()
+
+
 # Task configuration
 ALL_TASKS = {
-    'mnist_digit': {'output_size': 10, 'dataset': 'mnist', 'description': 'MNIST digit classification (0-9)'},
-    'mnist_even_odd': {'output_size': 2, 'dataset': 'mnist', 'description': 'MNIST even/odd classification'},
-    'cifar_fine': {'output_size': 10, 'dataset': 'cifar', 'description': 'CIFAR-10 fine classification (10 classes)'},
-    'cifar_coarse': {'output_size': 2, 'dataset': 'cifar', 'description': 'CIFAR-10 coarse (animal vs vehicle)'},
-    'fashion_fine': {'output_size': 10, 'dataset': 'fashion', 'description': 'Fashion MNIST classification (10 classes)'},
-    'emnist_fine': {'output_size': 47, 'dataset': 'emnist', 'description': 'EMNIST balanced classification (47 classes)'},
+    # Vision tasks (image modality)
+    'mnist_digit': {'output_size': 10, 'dataset': 'mnist', 'modality': 'image', 'description': 'MNIST digit classification (0-9)'},
+    'mnist_even_odd': {'output_size': 2, 'dataset': 'mnist', 'modality': 'image', 'description': 'MNIST even/odd classification'},
+    'cifar_fine': {'output_size': 10, 'dataset': 'cifar', 'modality': 'image', 'description': 'CIFAR-10 fine classification (10 classes)'},
+    'cifar_coarse': {'output_size': 2, 'dataset': 'cifar', 'modality': 'image', 'description': 'CIFAR-10 coarse (animal vs vehicle)'},
+    'fashion_fine': {'output_size': 10, 'dataset': 'fashion', 'modality': 'image', 'description': 'Fashion MNIST classification (10 classes)'},
+    'emnist_fine': {'output_size': 47, 'dataset': 'emnist', 'modality': 'image', 'description': 'EMNIST balanced classification (47 classes)'},
+    # Audio tasks (audio modality)
+    'speech_commands': {'output_size': 35, 'dataset': 'speech_commands', 'modality': 'audio', 'description': 'Speech Commands (35 spoken words)'},
+    # Tabular tasks (tabular modality)
+    'wine_type': {'output_size': 3, 'dataset': 'wine', 'modality': 'tabular', 'description': 'Wine classification (3 types)'},
 }
 
 
@@ -116,6 +186,262 @@ class AdaptiveCNNEncoder(nn.Module):
         return x
 
 
+class PerceiverEncoder(nn.Module):
+    """
+    Perceiver-style encoder that handles multiple modalities uniformly.
+    
+    Tokenizes any input (image, audio spectrogram, tabular) into a sequence,
+    then uses cross-attention from learnable latents to compress into fixed-size output.
+    
+    Modalities:
+    - image: (B, C, H, W) → pixels + Fourier positional encoding
+    - audio: (B, 1, freq, time) mel spectrogram → time-freq bins + positional encoding  
+    - tabular: (B, features) → each feature as token + learnable positional encoding
+    """
+    
+    def __init__(
+        self,
+        output_dim: int,
+        num_latents: int,
+        latent_dim: int,
+        num_fourier_features: int,
+        num_heads: int,
+        num_cross_attn_layers: int,
+        dropout: float,
+    ):
+        super(PerceiverEncoder, self).__init__()
+        
+        self.output_dim = output_dim
+        self.num_latents = num_latents
+        self.latent_dim = latent_dim
+        self.num_fourier_features = num_fourier_features
+        
+        # Learnable latent array (queries for cross-attention)
+        self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
+        self.latent_pos = nn.Parameter(torch.randn(num_latents, latent_dim))
+        
+        # Fourier feature matrices for 2D positional encoding (image/audio)
+        self.register_buffer('fourier_matrix_2d', torch.randn(2, num_fourier_features))
+        # Fourier feature matrix for 1D positional encoding (tabular)
+        self.register_buffer('fourier_matrix_1d', torch.randn(1, num_fourier_features))
+        
+        # Token dimensions: value + Fourier features
+        # Image: RGB (1 or 3) + 2*num_fourier_features
+        # Audio: magnitude (1) + 2*num_fourier_features
+        # Tabular: value (1) + 2*num_fourier_features
+        
+        # Modality-specific input projections to latent_dim
+        self.image_proj_1ch = nn.Linear(1 + 2 * num_fourier_features, latent_dim)
+        self.image_proj_3ch = nn.Linear(3 + 2 * num_fourier_features, latent_dim)
+        self.audio_proj = nn.Linear(1 + 2 * num_fourier_features, latent_dim)
+        self.tabular_proj = nn.Linear(1 + 2 * num_fourier_features, latent_dim)
+        
+        # Cross-attention layers (latents attend to input tokens)
+        self.cross_attn_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=latent_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            for _ in range(num_cross_attn_layers)
+        ])
+        
+        self.cross_attn_norms = nn.ModuleList([
+            nn.LayerNorm(latent_dim)
+            for _ in range(num_cross_attn_layers)
+        ])
+        
+        # Self-attention block for latents
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.self_attn_norm = nn.LayerNorm(latent_dim)
+        
+        # MLP after attention
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 2, latent_dim),
+        )
+        self.mlp_norm = nn.LayerNorm(latent_dim)
+        
+        # Output projection
+        self.output_proj = nn.Linear(latent_dim, output_dim)
+    
+    def create_fourier_encoding_2d(
+        self,
+        height: int,
+        width: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create 2D Fourier positional encoding for image/audio grids."""
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(height, device=device),
+            torch.arange(width, device=device),
+            indexing='ij'
+        )
+        
+        # Normalize to [0, 1]
+        x_coords = x_coords.float() / max(width - 1, 1)
+        y_coords = y_coords.float() / max(height - 1, 1)
+        
+        # Stack: (H, W, 2)
+        coords = torch.stack([x_coords, y_coords], dim=-1)
+        
+        # Flatten and expand: (B, H*W, 2)
+        coords = coords.view(-1, 2).unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Fourier projection: (B, H*W, num_fourier_features)
+        fourier_proj = torch.matmul(coords, self.fourier_matrix_2d)
+        
+        # Sin and cos features: (B, H*W, 2*num_fourier_features)
+        fourier_features = torch.cat([
+            torch.cos(2 * math.pi * fourier_proj),
+            torch.sin(2 * math.pi * fourier_proj)
+        ], dim=-1)
+        
+        return fourier_features
+    
+    def create_fourier_encoding_1d(
+        self,
+        num_features: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create 1D Fourier positional encoding for tabular data."""
+        # Feature indices normalized to [0, 1]
+        indices = torch.arange(num_features, device=device).float()
+        indices = indices / max(num_features - 1, 1)
+        
+        # Expand: (B, num_features, 1)
+        indices = indices.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, -1)
+        
+        # Fourier projection: (B, num_features, num_fourier_features)
+        fourier_proj = torch.matmul(indices, self.fourier_matrix_1d)
+        
+        # Sin and cos features: (B, num_features, 2*num_fourier_features)
+        fourier_features = torch.cat([
+            torch.cos(2 * math.pi * fourier_proj),
+            torch.sin(2 * math.pi * fourier_proj)
+        ], dim=-1)
+        
+        return fourier_features
+    
+    def tokenize_image(self, x: torch.Tensor) -> torch.Tensor:
+        """Tokenize image: (B, C, H, W) → (B, H*W, latent_dim)"""
+        batch_size, channels, height, width = x.shape
+        device = x.device
+        
+        # Reshape to tokens: (B, C, H, W) → (B, H*W, C)
+        value_tokens = x.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, channels)
+        
+        # Get positional encoding: (B, H*W, 2*num_fourier_features)
+        pos_encoding = self.create_fourier_encoding_2d(height, width, batch_size, device)
+        
+        # Concatenate value + position: (B, H*W, C + 2*num_fourier_features)
+        tokens = torch.cat([value_tokens, pos_encoding], dim=-1)
+        
+        # Project to latent dim
+        if channels == 1:
+            tokens = self.image_proj_1ch(tokens)
+        else:
+            tokens = self.image_proj_3ch(tokens)
+        
+        return tokens
+    
+    def tokenize_audio(self, x: torch.Tensor) -> torch.Tensor:
+        """Tokenize audio spectrogram: (B, 1, freq, time) → (B, freq*time, latent_dim)"""
+        batch_size, channels, freq, time = x.shape
+        device = x.device
+        
+        # Reshape to tokens: (B, 1, freq, time) → (B, freq*time, 1)
+        value_tokens = x.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 1)
+        
+        # Get positional encoding: (B, freq*time, 2*num_fourier_features)
+        pos_encoding = self.create_fourier_encoding_2d(freq, time, batch_size, device)
+        
+        # Concatenate: (B, freq*time, 1 + 2*num_fourier_features)
+        tokens = torch.cat([value_tokens, pos_encoding], dim=-1)
+        
+        # Project to latent dim
+        tokens = self.audio_proj(tokens)
+        
+        return tokens
+    
+    def tokenize_tabular(self, x: torch.Tensor) -> torch.Tensor:
+        """Tokenize tabular data: (B, features) → (B, features, latent_dim)"""
+        batch_size, num_features = x.shape
+        device = x.device
+        
+        # Each feature becomes a token: (B, features) → (B, features, 1)
+        value_tokens = x.unsqueeze(-1)
+        
+        # Get positional encoding: (B, features, 2*num_fourier_features)
+        pos_encoding = self.create_fourier_encoding_1d(num_features, batch_size, device)
+        
+        # Concatenate: (B, features, 1 + 2*num_fourier_features)
+        tokens = torch.cat([value_tokens, pos_encoding], dim=-1)
+        
+        # Project to latent dim
+        tokens = self.tabular_proj(tokens)
+        
+        return tokens
+    
+    def forward(self, x: torch.Tensor, modality: str) -> torch.Tensor:
+        """
+        Encode input of any modality to fixed-size representation.
+        
+        Args:
+            x: Input tensor (shape depends on modality)
+            modality: 'image', 'audio', or 'tabular'
+        
+        Returns:
+            (B, output_dim) encoded representation
+        """
+        batch_size = x.shape[0]
+        
+        # Tokenize based on modality
+        if modality == 'image':
+            tokens = self.tokenize_image(x)
+        elif modality == 'audio':
+            tokens = self.tokenize_audio(x)
+        elif modality == 'tabular':
+            tokens = self.tokenize_tabular(x)
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
+        
+        # Initialize latents with positional encoding
+        latents = self.latents + self.latent_pos  # (num_latents, latent_dim)
+        latents = latents.unsqueeze(0).expand(batch_size, -1, -1)  # (B, num_latents, latent_dim)
+        
+        # Cross-attention: latents attend to input tokens
+        for cross_attn, norm in zip(self.cross_attn_layers, self.cross_attn_norms):
+            attn_out, _ = cross_attn(latents, tokens, tokens)
+            latents = norm(latents + attn_out)
+        
+        # Self-attention on latents
+        self_attn_out, _ = self.self_attn(latents, latents, latents)
+        latents = self.self_attn_norm(latents + self_attn_out)
+        
+        # MLP
+        mlp_out = self.mlp(latents)
+        latents = self.mlp_norm(latents + mlp_out)
+        
+        # Global average pooling over latents
+        pooled = latents.mean(dim=1)  # (B, latent_dim)
+        
+        # Project to output dimension
+        output = self.output_proj(pooled)  # (B, output_dim)
+        
+        return output
+
+
 class MultitaskGatedCTM(nn.Module):
     """
     Multitask Gated Synchronization Continuous Thought Machine.
@@ -146,6 +472,12 @@ class MultitaskGatedCTM(nn.Module):
         task_output_sizes: list[int],
         n_sync_sets: int,
         load_balance_coef: float,
+        dropout_encoder: float,
+        dropout_attention: float,
+        dropout_synapse: float,
+        dropout_nlm: float,
+        dropout_sync: float,
+        dropout_output: float,
     ):
         super(MultitaskGatedCTM, self).__init__()
 
@@ -159,6 +491,14 @@ class MultitaskGatedCTM(nn.Module):
         self.load_balance_coef = load_balance_coef
         self.n_tasks = len(task_output_sizes)
         self.task_output_sizes = task_output_sizes
+        
+        # Dropout layers for different stages
+        self.dropout_encoder = nn.Dropout(dropout_encoder)
+        self.dropout_synapse = nn.Dropout(dropout_synapse)
+        self.dropout_nlm = nn.Dropout(dropout_nlm)
+        self.dropout_sync = nn.Dropout(dropout_sync)
+        self._dropout_attention_rate = dropout_attention
+        self._dropout_output_rate = dropout_output
         
         # Learnable initial states (Section 3.1 - start states)
         self.register_parameter(
@@ -176,8 +516,16 @@ class MultitaskGatedCTM(nn.Module):
             ))
         )
         
-        # Adaptive CNN encoder - SHARED across all tasks
-        self.image_encoder = AdaptiveCNNEncoder(n_representation_size)
+        # Perceiver encoder - handles all modalities uniformly
+        self.perceiver_encoder = PerceiverEncoder(
+            output_dim=n_representation_size,
+            num_latents=32,
+            latent_dim=64,
+            num_fourier_features=32,
+            num_heads=4,
+            num_cross_attn_layers=2,
+            dropout=dropout_encoder,
+        )
         
         # Key-Value projection for attention (from encoded input)
         self.kv_proj = nn.Sequential(
@@ -192,7 +540,7 @@ class MultitaskGatedCTM(nn.Module):
         self.attention = nn.MultiheadAttention(
             embed_dim=n_representation_size,
             num_heads=n_attention_heads,
-            dropout=0.0,
+            dropout=dropout_attention,
             batch_first=True
         )
         
@@ -247,9 +595,11 @@ class MultitaskGatedCTM(nn.Module):
                 nn.Linear(n_synch_out, 256),
                 nn.LayerNorm(256),
                 nn.ReLU(),
+                nn.Dropout(dropout_output),
                 nn.Linear(256, 64),
                 nn.LayerNorm(64),
                 nn.ReLU(),
+                nn.Dropout(dropout_output),
                 nn.Linear(64, output_size)
             )
             for output_size in task_output_sizes
@@ -381,20 +731,26 @@ class MultitaskGatedCTM(nn.Module):
         certainty = torch.stack((normalized_entropy, 1 - normalized_entropy), dim=-1)
         return certainty
     
-    def forward(self, x: torch.Tensor, task_idx: int, track: bool = False):
+    def forward(self, x: torch.Tensor, task_idx: int, modality: str, track: bool = False):
         """
         Forward pass through the Multitask Gated CTM for a specific task.
+        
+        Args:
+            x: Input tensor (shape depends on modality)
+            task_idx: Index of the task in task_output_sizes
+            modality: 'image', 'audio', or 'tabular'
+            track: Whether to track activations for visualization
         
         Returns predictions, certainties, and load_balance_loss for ALL ticks.
         """
         batch_size = x.shape[0]
         device = x.device
         
-        # Encode the image using adaptive CNN encoder
-        encoded_image = self.image_encoder(x)
+        # Encode using Perceiver (handles all modalities)
+        encoded_input = self.perceiver_encoder(x, modality=modality)
         
         # Prepare key-value features for attention
-        kv = self.kv_proj(encoded_image).unsqueeze(1)
+        kv = self.kv_proj(encoded_input).unsqueeze(1)
         
         # Initialize recurrent state from learnable parameters
         state_trace = self.start_trace.unsqueeze(0).expand(batch_size, -1, -1).clone()
@@ -437,6 +793,7 @@ class MultitaskGatedCTM(nn.Module):
             sync_action, decay_alphas_action, decay_betas_action, gate_weights_action = self.compute_gated_synchronization(
                 activated_state, decay_alphas_action, decay_betas_action, synch_type='action'
             )
+            sync_action = self.dropout_sync(sync_action)
             all_gate_weights_action.append(gate_weights_action)
             
             # Create query from action synchronization
@@ -451,6 +808,7 @@ class MultitaskGatedCTM(nn.Module):
             
             # Apply synapse model to get new pre-activations
             new_state = self.synapse_model(pre_synapse_input)
+            new_state = self.dropout_synapse(new_state)
             
             # Update state trace (FIFO buffer of pre-activations)
             state_trace = torch.cat([state_trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
@@ -463,11 +821,13 @@ class MultitaskGatedCTM(nn.Module):
                 post_activations_list.append(post_activation)
             
             activated_state = torch.cat(post_activations_list, dim=-1)
+            activated_state = self.dropout_nlm(activated_state)
             
             # Calculate gated synchronization for output predictions
             sync_out, decay_alphas_out, decay_betas_out, gate_weights_out = self.compute_gated_synchronization(
                 activated_state, decay_alphas_out, decay_betas_out, synch_type='out'
             )
+            sync_out = self.dropout_sync(sync_out)
             all_gate_weights_out.append(gate_weights_out)
             
             # Get predictions using task-specific output projector
@@ -514,35 +874,162 @@ CIFAR10_COARSE_LABELS = {
     0: 1, 1: 1, 8: 1, 9: 1  # Vehicles
 }
 
+# Speech Commands labels (35 classes)
+SPEECH_COMMANDS_LABELS = [
+    'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five', 'follow',
+    'forward', 'four', 'go', 'happy', 'house', 'learn', 'left', 'marvin', 'nine',
+    'no', 'off', 'on', 'one', 'right', 'seven', 'sheila', 'six', 'stop', 'three',
+    'tree', 'two', 'up', 'visual', 'wow', 'yes', 'zero'
+]
+
+
+class SpeechCommandsDataset(Dataset):
+    """
+    Speech Commands dataset wrapper.
+    Converts audio waveforms to mel spectrograms for Perceiver processing.
+    35 spoken word classes: yes, no, up, down, left, right, etc.
+    
+    This dataset downloads automatically via torchaudio.
+    """
+    
+    def __init__(self, root: str, subset: str, download: bool):
+        self.root = root
+        self.subset = subset
+        
+        # Speech Commands from torchaudio (auto-downloads)
+        self.dataset = torchaudio.datasets.SPEECHCOMMANDS(
+            root=root,
+            subset=subset,
+            download=download
+        )
+        
+        # Mel spectrogram transform (16kHz is native sample rate)
+        self.target_sample_rate = 16000
+        self.mel_transform = MelSpectrogram(
+            sample_rate=self.target_sample_rate,
+            n_mels=32,
+            n_fft=400,
+            hop_length=320,
+        )
+        
+        # Build label to index mapping
+        self.label_to_idx = {label: idx for idx, label in enumerate(SPEECH_COMMANDS_LABELS)}
+    
+    def __len__(self) -> int:
+        return len(self.dataset)
+    
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        waveform, sample_rate, label, speaker_id, utterance_number = self.dataset[idx]
+        
+        # Resample if needed (should be 16kHz already)
+        if sample_rate != self.target_sample_rate:
+            resampler = Resample(orig_freq=sample_rate, new_freq=self.target_sample_rate)
+            waveform = resampler(waveform)
+        
+        # Pad or truncate to 1 second (16000 samples)
+        target_length = self.target_sample_rate  # 1 second
+        if waveform.shape[1] > target_length:
+            waveform = waveform[:, :target_length]
+        else:
+            padding = target_length - waveform.shape[1]
+            waveform = F.pad(waveform, (0, padding))
+        
+        # Convert to mel spectrogram: (1, n_mels, time)
+        mel_spec = self.mel_transform(waveform)
+        
+        # Log scale
+        mel_spec = torch.log(mel_spec + 1e-9)
+        
+        # Normalize
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-9)
+        
+        # Get label index
+        label_idx = self.label_to_idx.get(label, 0)
+        
+        return mel_spec, label_idx
+
+
+class WineDataset(Dataset):
+    """
+    Wine classification dataset wrapper.
+    Uses sklearn's wine dataset - 13 features, 3 classes.
+    """
+    
+    def __init__(self, train: bool, test_ratio: float):
+        wine = load_wine()
+        X = torch.tensor(wine.data, dtype=torch.float32)
+        y = torch.tensor(wine.target, dtype=torch.long)
+        
+        # Normalize features
+        self.mean = X.mean(dim=0)
+        self.std = X.std(dim=0) + 1e-9
+        X = (X - self.mean) / self.std
+        
+        # Train/test split
+        n_samples = len(X)
+        n_test = int(n_samples * test_ratio)
+        
+        # Use fixed seed for reproducibility
+        torch.manual_seed(42)
+        perm = torch.randperm(n_samples)
+        
+        if train:
+            indices = perm[n_test:]
+        else:
+            indices = perm[:n_test]
+        
+        self.X = X[indices]
+        self.y = y[indices]
+    
+    def __len__(self) -> int:
+        return len(self.X)
+    
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        return self.X[idx], self.y[idx].item()
+
 
 class CombinedMultitaskDataset(Dataset):
     """
-    Combined dataset that mixes multiple image datasets.
+    Combined dataset that mixes multiple datasets across modalities.
     Uses -1 for non-applicable task labels (masked in loss computation).
+    
+    Supports:
+    - Image datasets: MNIST, CIFAR, Fashion, EMNIST
+    - Audio datasets: Speech Commands (mel spectrograms)
+    - Tabular datasets: Wine
     """
     def __init__(
         self, 
         mnist_dataset: Dataset | None, 
         cifar_dataset: Dataset | None,
         fashion_dataset: Dataset | None,
-        emnist_dataset: Dataset | None
+        emnist_dataset: Dataset | None,
+        speech_commands_dataset: Dataset | None,
+        wine_dataset: Dataset | None,
     ):
         self.mnist_dataset = mnist_dataset
         self.cifar_dataset = cifar_dataset
         self.fashion_dataset = fashion_dataset
         self.emnist_dataset = emnist_dataset
+        self.speech_commands_dataset = speech_commands_dataset
+        self.wine_dataset = wine_dataset
         
         self.mnist_len = len(mnist_dataset) if mnist_dataset is not None else 0
         self.cifar_len = len(cifar_dataset) if cifar_dataset is not None else 0
         self.fashion_len = len(fashion_dataset) if fashion_dataset is not None else 0
         self.emnist_len = len(emnist_dataset) if emnist_dataset is not None else 0
+        self.speech_commands_len = len(speech_commands_dataset) if speech_commands_dataset is not None else 0
+        self.wine_len = len(wine_dataset) if wine_dataset is not None else 0
         
-        self.total_len = self.mnist_len + self.cifar_len + self.fashion_len + self.emnist_len
+        self.total_len = (self.mnist_len + self.cifar_len + self.fashion_len + 
+                         self.emnist_len + self.speech_commands_len + self.wine_len)
         
         self.mnist_end = self.mnist_len
         self.cifar_end = self.mnist_end + self.cifar_len
         self.fashion_end = self.cifar_end + self.fashion_len
         self.emnist_end = self.fashion_end + self.emnist_len
+        self.speech_commands_end = self.emnist_end + self.speech_commands_len
+        self.wine_end = self.speech_commands_end + self.wine_len
     
     def __len__(self) -> int:
         return self.total_len
@@ -555,6 +1042,8 @@ class CombinedMultitaskDataset(Dataset):
             'cifar_coarse': -1,
             'fashion_fine': -1,
             'emnist_fine': -1,
+            'speech_commands': -1,
+            'wine_type': -1,
         }
     
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, dict[str, int], str]:
@@ -579,37 +1068,51 @@ class CombinedMultitaskDataset(Dataset):
             labels['fashion_fine'] = fine_label
             return image, labels, 'fashion'
         
-        else:
+        elif idx < self.emnist_end:
             emnist_idx = idx - self.fashion_end
             image, char_label = self.emnist_dataset[emnist_idx]
             labels['emnist_fine'] = char_label
             return image, labels, 'emnist'
+        
+        elif idx < self.speech_commands_end:
+            sc_idx = idx - self.emnist_end
+            spectrogram, word_label = self.speech_commands_dataset[sc_idx]
+            labels['speech_commands'] = word_label
+            return spectrogram, labels, 'speech_commands'
+        
+        else:
+            wine_idx = idx - self.speech_commands_end
+            features, wine_label = self.wine_dataset[wine_idx]
+            labels['wine_type'] = wine_label
+            return features, labels, 'wine'
 
 
 def custom_collate_fn(batch: list) -> tuple:
-    """Custom collate function for combined dataset with mixed image sizes."""
-    dataset_images: dict[str, list] = {
+    """Custom collate function for combined dataset with mixed data types."""
+    dataset_data: dict[str, list] = {
         'mnist': [], 'cifar': [], 'fashion': [], 'emnist': [],
+        'speech_commands': [], 'wine': [],
     }
     labels_dict = {key: [] for key in batch[0][1].keys()}
     sources = []
     batch_indices: dict[str, list] = {
         'mnist': [], 'cifar': [], 'fashion': [], 'emnist': [],
+        'speech_commands': [], 'wine': [],
     }
     
-    for idx, (image, labels, source) in enumerate(batch):
-        dataset_images[source].append(image)
+    for idx, (data, labels, source) in enumerate(batch):
+        dataset_data[source].append(data)
         batch_indices[source].append(idx)
         for key, val in labels.items():
             labels_dict[key].append(val)
         sources.append(source)
     
-    stacked_images = {
-        key: torch.stack(images) if images else None
-        for key, images in dataset_images.items()
+    stacked_data = {
+        key: torch.stack(items) if items else None
+        for key, items in dataset_data.items()
     }
     
-    return stacked_images, labels_dict, sources, batch_indices
+    return stacked_data, labels_dict, sources, batch_indices
 
 
 @dataclass
@@ -649,13 +1152,25 @@ def train_multitask_gated_model(
     
     metrics = TrainingMetrics(task_names=task_names)
     
-    original_task_names = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+    original_task_names = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine', 'speech_commands', 'wine_type']
     
     dataset_task_indices = {
         'mnist': [0, 1],
         'cifar': [2, 3],
         'fashion': [4],
         'emnist': [5],
+        'speech_commands': [6],
+        'wine': [7],
+    }
+    
+    # Mapping from dataset to modality for Perceiver encoder
+    dataset_modality = {
+        'mnist': 'image',
+        'cifar': 'image',
+        'fashion': 'image',
+        'emnist': 'image',
+        'speech_commands': 'audio',
+        'wine': 'tabular',
     }
     
     for epoch in range(epochs):
@@ -666,15 +1181,16 @@ def train_multitask_gated_model(
         total_balance_loss = 0.0
         balance_count = 0
         
-        for batch_idx, (stacked_images, labels, sources, batch_indices) in enumerate(train_loader):
+        for batch_idx, (stacked_data, labels, sources, batch_indices) in enumerate(train_loader):
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
             batch_balance_loss = torch.tensor(0.0, device=device)
             
             for dataset_name, task_indices in dataset_task_indices.items():
-                if stacked_images[dataset_name] is not None:
-                    data = stacked_images[dataset_name].to(device)
+                if stacked_data[dataset_name] is not None:
+                    data = stacked_data[dataset_name].to(device)
                     data_batch_indices = batch_indices[dataset_name]
+                    modality = dataset_modality[dataset_name]
                     
                     for original_idx in task_indices:
                         if original_idx in task_index_mapping:
@@ -686,7 +1202,7 @@ def train_multitask_gated_model(
                             
                             if (target >= 0).any():
                                 # Forward pass returns predictions for ALL ticks plus load balance loss
-                                predictions, certainties, load_balance_loss = model(data, task_idx=model_task_idx)
+                                predictions, certainties, load_balance_loss = model(data, task_idx=model_task_idx, modality=modality)
                                 
                                 # Compute loss across all ticks (Section 3.5)
                                 loss = torch.tensor(0.0, device=device)
@@ -718,28 +1234,26 @@ def train_multitask_gated_model(
                 balance_count += 1
             
             if batch_idx % 25 == 0:
-                avg_balance = batch_balance_loss.item() / max(1, sum(1 for d in dataset_task_indices if stacked_images[d] is not None))
+                avg_balance = batch_balance_loss.item() / max(1, sum(1 for d in dataset_task_indices if stacked_data[d] is not None))
                 print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
                       f'Total Loss: {total_loss.item():.4f}, Balance: {avg_balance:.4f}')
             
             # Gate inspection at batch 100
-            if batch_idx == 100:
-                print('\n' + '='*60)
-                print('GATE INSPECTION AT BATCH 100')
-                print('='*60)
+            if batch_idx % 500 == 0:
                 model.eval()
                 with torch.no_grad():
                     # Find first available data for inspection
                     for dataset_name, task_indices in dataset_task_indices.items():
-                        data = stacked_images.get(dataset_name)
+                        data = stacked_data.get(dataset_name)
                         if data is not None:
+                            modality = dataset_modality[dataset_name]
                             for original_idx in task_indices:
                                 if original_idx in task_index_mapping:
                                     model_task_idx = task_index_mapping[original_idx]
                                     task_name = task_names[model_task_idx]
                                     
                                     # Forward with tracking to get gate weights
-                                    results = model(data[:8].to(device), task_idx=model_task_idx, track=True)
+                                    results = model(data[:8].to(device), task_idx=model_task_idx, modality=modality, track=True)
                                     predictions, certainties, lb_loss, syncs, pre_acts, post_acts, attn, gates = results
                                     gate_action, gate_out = gates
                                     
@@ -748,7 +1262,7 @@ def train_multitask_gated_model(
                                     avg_gate_action = gate_action.mean(axis=1)  # (ticks, n_sets)
                                     avg_gate_out = gate_out.mean(axis=1)
                                     
-                                    print(f'\nTask: {task_name}')
+                                    print(f'\nTask: {task_name} (modality: {modality})')
                                     print(f'Action Gate Weights (avg over batch, first/mid/last tick):')
                                     print(f'  Tick 0:  {avg_gate_action[0]}')
                                     print(f'  Tick 7:  {avg_gate_action[7]}')
@@ -778,8 +1292,8 @@ def train_multitask_gated_model(
                                     _, predicted = torch.max(final_preds, 1)
                                     correct = (predicted == target).sum().item()
                                     print(f'Batch accuracy: {correct}/8 = {100*correct/8:.1f}%')
-                                    break
-                            break
+                                    
+                            continue
                 print('='*60 + '\n')
                 model.train()
         
@@ -833,21 +1347,33 @@ def evaluate_multitask_gated_model(
     task_correct = {name: 0 for name in task_names}
     task_total = {name: 0 for name in task_names}
     
-    original_task_names = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+    original_task_names = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine', 'speech_commands', 'wine_type']
     
     dataset_task_indices = {
         'mnist': [0, 1],
         'cifar': [2, 3],
         'fashion': [4],
         'emnist': [5],
+        'speech_commands': [6],
+        'wine': [7],
+    }
+    
+    dataset_modality = {
+        'mnist': 'image',
+        'cifar': 'image',
+        'fashion': 'image',
+        'emnist': 'image',
+        'speech_commands': 'audio',
+        'wine': 'tabular',
     }
     
     with torch.no_grad():
-        for stacked_images, labels, sources, batch_indices in test_loader:
+        for stacked_data, labels, sources, batch_indices in test_loader:
             for dataset_name, task_indices in dataset_task_indices.items():
-                if stacked_images[dataset_name] is not None:
-                    data = stacked_images[dataset_name].to(device)
+                if stacked_data[dataset_name] is not None:
+                    data = stacked_data[dataset_name].to(device)
                     data_batch_indices = batch_indices[dataset_name]
+                    modality = dataset_modality[dataset_name]
                     
                     for original_idx in task_indices:
                         if original_idx in task_index_mapping:
@@ -858,7 +1384,7 @@ def evaluate_multitask_gated_model(
                             target = torch.tensor([labels[original_task_name][i] for i in data_batch_indices]).to(device)
                             
                             if (target >= 0).any():
-                                predictions, _, _ = model(data, task_idx=model_task_idx)
+                                predictions, _, _ = model(data, task_idx=model_task_idx, modality=modality)
                                 final_predictions = predictions[..., -1]
                                 
                                 valid_mask = target >= 0
@@ -882,13 +1408,14 @@ def get_neural_dynamics(
     model: MultitaskGatedCTM,
     x: torch.Tensor,
     task_idx: int,
-    device: torch.device
+    modality: str,
+    device: torch.device,
 ) -> tuple[torch.Tensor, dict[str, np.ndarray], tuple[np.ndarray, np.ndarray]]:
     """Extract neural dynamics, synchronizations, and gate weights for visualization."""
     model.eval()
     
     with torch.no_grad():
-        results = model(x.to(device), task_idx=task_idx, track=True)
+        results = model(x.to(device), task_idx=task_idx, modality=modality, track=True)
         predictions, certainties, load_balance_loss, syncs, pre_acts, post_acts, attn, gates = results
     
     post_history = torch.from_numpy(post_acts).permute(1, 2, 0)  # (B, neurons, ticks)
@@ -898,9 +1425,10 @@ def get_neural_dynamics(
 
 def plot_neural_dynamics_for_task(
     model: MultitaskGatedCTM,
-    sample_image: torch.Tensor,
+    sample_data: torch.Tensor,
     task_idx: int,
     task_name: str,
+    modality: str,
     device: torch.device,
     output_path: str,
     epoch: int,
@@ -909,29 +1437,45 @@ def plot_neural_dynamics_for_task(
     model.eval()
     with torch.no_grad():
         post_history, task_syncs, gates = get_neural_dynamics(
-            model, sample_image.unsqueeze(0), task_idx=task_idx, device=device
+            model, sample_data.unsqueeze(0), task_idx=task_idx, modality=modality, device=device
         )
     gate_action, gate_out = gates
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'Neural Dynamics - {task_name} (Epoch {epoch})', fontsize=14, fontweight='bold')
+    fig.suptitle(f'Neural Dynamics - {task_name} [{modality}] (Epoch {epoch})', fontsize=14, fontweight='bold')
     
-    # Input image
-    ax_img = axes[0, 0]
-    img_np = sample_image.cpu().numpy()
-    if img_np.shape[0] == 3:
-        mean = np.array([0.4914, 0.4822, 0.4465]).reshape(3, 1, 1)
-        std = np.array([0.2470, 0.2435, 0.2616]).reshape(3, 1, 1)
-        img_np = img_np * std + mean
-        img_np = np.clip(img_np, 0, 1)
-        img_np = np.transpose(img_np, (1, 2, 0))
-        ax_img.imshow(img_np)
-    else:
-        img_np = img_np * 0.3081 + 0.1307
-        img_np = np.clip(img_np, 0, 1)
-        ax_img.imshow(img_np.squeeze(), cmap='gray')
-    ax_img.set_title(f'Input Image ({task_name})')
-    ax_img.axis('off')
+    # Input visualization (depends on modality)
+    ax_input = axes[0, 0]
+    data_np = sample_data.cpu().numpy()
+    
+    if modality == 'image':
+        if data_np.shape[0] == 3:
+            mean = np.array([0.4914, 0.4822, 0.4465]).reshape(3, 1, 1)
+            std = np.array([0.2470, 0.2435, 0.2616]).reshape(3, 1, 1)
+            data_np = data_np * std + mean
+            data_np = np.clip(data_np, 0, 1)
+            data_np = np.transpose(data_np, (1, 2, 0))
+            ax_input.imshow(data_np)
+        else:
+            data_np = data_np * 0.3081 + 0.1307
+            data_np = np.clip(data_np, 0, 1)
+            ax_input.imshow(data_np.squeeze(), cmap='gray')
+        ax_input.set_title(f'Input Image ({task_name})')
+    elif modality == 'audio':
+        # Audio spectrogram visualization
+        spec = data_np.squeeze()
+        im = ax_input.imshow(spec, aspect='auto', origin='lower', cmap='viridis')
+        ax_input.set_xlabel('Time')
+        ax_input.set_ylabel('Frequency')
+        ax_input.set_title(f'Mel Spectrogram ({task_name})')
+        plt.colorbar(im, ax=ax_input, label='Log Magnitude')
+    elif modality == 'tabular':
+        # Bar chart for tabular features
+        ax_input.bar(range(len(data_np)), data_np)
+        ax_input.set_xlabel('Feature Index')
+        ax_input.set_ylabel('Normalized Value')
+        ax_input.set_title(f'Tabular Features ({task_name})')
+    ax_input.axis('off') if modality == 'image' else None
     
     # Post-activation dynamics
     ax_activity = axes[0, 1]
@@ -981,23 +1525,30 @@ def generate_epoch_plots(
     epoch: int,
 ):
     """Generate neural dynamics plots for all tasks at end of epoch."""
-    all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+    all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine', 'speech_commands', 'wine_type']
     
-    # Get sample images for each task from test dataset
+    task_to_modality = {
+        'mnist_digit': 'image', 'mnist_even_odd': 'image',
+        'cifar_fine': 'image', 'cifar_coarse': 'image',
+        'fashion_fine': 'image', 'emnist_fine': 'image',
+        'speech_commands': 'audio', 'wine_type': 'tabular',
+    }
+    
+    # Get sample data for each task from test dataset
     task_samples: dict[str, torch.Tensor] = {}
     
     for idx in range(len(test_dataset)):
-        image, labels, source = test_dataset[idx]
+        data, labels, source = test_dataset[idx]
         
         for task_name in task_names:
             if task_name in task_samples:
                 continue
             
-            original_idx = all_task_order.index(task_name)
-            label_key = all_task_order[original_idx]
-            
-            if labels.get(label_key, -1) >= 0:
-                task_samples[task_name] = image
+            if task_name in all_task_order:
+                label_key = task_name
+                
+                if labels.get(label_key, -1) >= 0:
+                    task_samples[task_name] = data
         
         if len(task_samples) == len(task_names):
             break
@@ -1008,16 +1559,18 @@ def generate_epoch_plots(
         if task_name not in task_samples:
             continue
         
-        sample_image = task_samples[task_name]
+        sample_data = task_samples[task_name]
         original_idx = all_task_order.index(task_name)
         model_task_idx = task_index_mapping[original_idx]
+        modality = task_to_modality.get(task_name, 'image')
         
         output_path = os.path.join(output_folder, f'epoch{epoch:02d}_{task_name}_dynamics.png')
         plot_neural_dynamics_for_task(
             model=model,
-            sample_image=sample_image,
+            sample_data=sample_data,
             task_idx=model_task_idx,
             task_name=task_name,
+            modality=modality,
             device=device,
             output_path=output_path,
             epoch=epoch,
@@ -1166,7 +1719,7 @@ def print_model_info(model: MultitaskGatedCTM):
     print(f'Task output sizes: {model.task_output_sizes}')
     
     print(f'\nShared components:')
-    shared = ['image_encoder', 'kv_proj', 'q_proj', 'attention', 'synapse_model', 
+    shared = ['perceiver_encoder', 'kv_proj', 'q_proj', 'attention', 'synapse_model', 
               'neuron_level_models', 'gate_network_action', 'gate_network_out']
     for name in shared:
         if hasattr(model, name):
@@ -1187,6 +1740,14 @@ def print_model_info(model: MultitaskGatedCTM):
     print(f'  start_trace: {model.start_trace.numel():,} elements')
     print(f'  set_decay_params_action: {sum(p.numel() for p in model.set_decay_params_action):,} elements')
     print(f'  set_decay_params_out: {sum(p.numel() for p in model.set_decay_params_out):,} elements')
+    
+    print(f'\nDropout rates:')
+    print(f'  perceiver (internal): see perceiver_encoder')
+    print(f'  attention: {model._dropout_attention_rate}')
+    print(f'  synapse: {model.dropout_synapse.p}')
+    print(f'  nlm: {model.dropout_nlm.p}')
+    print(f'  sync: {model.dropout_sync.p}')
+    print(f'  output: {model._dropout_output_rate}')
     print(f'================================================\n')
 
 
@@ -1196,6 +1757,12 @@ def train_combined(
     epochs: int, 
     n_neurons: int, 
     n_sync_sets: int,
+    dropout_encoder: float,
+    dropout_attention: float,
+    dropout_synapse: float,
+    dropout_nlm: float,
+    dropout_sync: float,
+    dropout_output: float,
     data_dir: str = './data',
     output_dir: str = '.',
 ) -> tuple:
@@ -1205,15 +1772,31 @@ def train_combined(
     print('='*60)
     
     # Create output folder for plots
-    output_prefix = '_'.join([t.split('_')[0][0] + t.split('_')[1][0] for t in selected_tasks]) + '_gated'
+    self_filename = os.path.basename(__file__)
+    output_prefix = self_filename.split('.')[0] + '_' + '_'.join([t.split('_')[0][0] + t.split('_')[1][0] for t in selected_tasks]) + '_gated'
     output_folder = os.path.join(output_dir, output_prefix + '_plots')
     os.makedirs(output_folder, exist_ok=True)
     print(f'Output folder: {output_folder}')
     
-    # Set MLflow tracking URI to output folder
-    mlflow_dir = os.path.join(output_folder, 'mlruns')
-    mlflow.set_tracking_uri(f'file://{os.path.abspath(mlflow_dir)}')
-    mlflow.set_experiment("gated_ctm")
+    # Set MLflow tracking URI to sqlite database in output folder
+    mlflow_db_path = os.path.join(output_folder, 'mlflow.db')
+    # Convert backslashes to forward slashes for URI compatibility on Windows
+    db_uri = f'sqlite:///{os.path.abspath(mlflow_db_path).replace(os.sep, "/")}'
+    mlflow.set_tracking_uri(db_uri)
+    
+    # Set experiment with custom artifact location
+    experiment_name = "gated_ctm"
+    try:
+        # Try to create with custom artifact location
+        artifact_uri = os.path.join(output_folder, "mlartifacts")
+        # Ensure artifact path uses forward slashes for URI compatibility
+        artifact_uri = f"file:///{os.path.abspath(artifact_uri).replace(os.sep, '/')}"
+        mlflow.create_experiment(experiment_name, artifact_location=artifact_uri)
+    except mlflow.exceptions.MlflowException:
+        # Experiment already exists
+        pass
+        
+    mlflow.set_experiment(experiment_name)
     
     # Start MLflow run
     with mlflow.start_run(run_name=output_prefix):
@@ -1232,13 +1815,21 @@ def train_combined(
             "n_attention_heads": 4,
             "load_balance_coef": 0.0,
             "learning_rate": 0.001,
-            "batch_size": 16,
+            "batch_size": 64,
+            "dropout_encoder": dropout_encoder,
+            "dropout_attention": dropout_attention,
+            "dropout_synapse": dropout_synapse,
+            "dropout_nlm": dropout_nlm,
+            "dropout_sync": dropout_sync,
+            "dropout_output": dropout_output,
         })
         
         needs_mnist = any(ALL_TASKS[t]['dataset'] == 'mnist' for t in selected_tasks)
         needs_cifar = any(ALL_TASKS[t]['dataset'] == 'cifar' for t in selected_tasks)
         needs_fashion = any(ALL_TASKS[t]['dataset'] == 'fashion' for t in selected_tasks)
         needs_emnist = any(ALL_TASKS[t]['dataset'] == 'emnist' for t in selected_tasks)
+        needs_speech_commands = any(ALL_TASKS[t]['dataset'] == 'speech_commands' for t in selected_tasks)
+        needs_wine = any(ALL_TASKS[t]['dataset'] == 'wine' for t in selected_tasks)
         
         mnist_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -1254,6 +1845,8 @@ def train_combined(
         cifar_train = cifar_test = None
         fashion_train = fashion_test = None
         emnist_train = emnist_test = None
+        speech_commands_train = speech_commands_test = None
+        wine_train = wine_test = None
         
         if needs_mnist:
             mnist_train = datasets.MNIST(root=data_dir, train=True, download=True, transform=mnist_transform)
@@ -1271,13 +1864,31 @@ def train_combined(
             emnist_train = datasets.EMNIST(root=data_dir, split='balanced', train=True, download=True, transform=mnist_transform)
             emnist_test = datasets.EMNIST(root=data_dir, split='balanced', train=False, download=True, transform=mnist_transform)
         
-        train_dataset = CombinedMultitaskDataset(mnist_train, cifar_train, fashion_train, emnist_train)
-        test_dataset = CombinedMultitaskDataset(mnist_test, cifar_test, fashion_test, emnist_test)
+        if needs_speech_commands:
+            try:
+                speech_commands_train = SpeechCommandsDataset(root=data_dir, subset='training', download=True)
+                speech_commands_test = SpeechCommandsDataset(root=data_dir, subset='testing', download=True)
+                print(f'  Loaded Speech Commands: {len(speech_commands_train)} train, {len(speech_commands_test)} test samples')
+            except Exception as e:
+                print(f'  Warning: Could not load Speech Commands dataset: {e}')
+                speech_commands_train = speech_commands_test = None
         
-        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, collate_fn=custom_collate_fn)
+        if needs_wine:
+            wine_train = WineDataset(train=True, test_ratio=0.2)
+            wine_test = WineDataset(train=False, test_ratio=0.2)
+            print(f'  Loaded Wine: {len(wine_train)} train, {len(wine_test)} test samples')
+        
+        train_dataset = CombinedMultitaskDataset(
+            mnist_train, cifar_train, fashion_train, emnist_train, speech_commands_train, wine_train
+        )
+        test_dataset = CombinedMultitaskDataset(
+            mnist_test, cifar_test, fashion_test, emnist_test, speech_commands_test, wine_test
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=custom_collate_fn)
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate_fn)
         
-        all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine']
+        all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine', 'speech_commands', 'wine_type']
         task_names = selected_tasks
         task_output_sizes = [ALL_TASKS[t]['output_size'] for t in selected_tasks]
         
@@ -1301,6 +1912,12 @@ def train_combined(
             task_output_sizes=task_output_sizes,
             n_sync_sets=n_sync_sets,
             load_balance_coef=0.0,  # Disabled to test if gates differentiate without balance pressure
+            dropout_encoder=dropout_encoder,
+            dropout_attention=dropout_attention,
+            dropout_synapse=dropout_synapse,
+            dropout_nlm=dropout_nlm,
+            dropout_sync=dropout_sync,
+            dropout_output=dropout_output,
         ).to(device)
         
         # Log model parameter count
@@ -1377,6 +1994,12 @@ def train_on_modal(
     epochs: int,
     n_neurons: int,
     n_sync_sets: int,
+    dropout_encoder: float,
+    dropout_attention: float,
+    dropout_synapse: float,
+    dropout_nlm: float,
+    dropout_sync: float,
+    dropout_output: float,
 ) -> dict:
     """
     Modal GPU training function.
@@ -1404,6 +2027,12 @@ def train_on_modal(
         epochs=epochs,
         n_neurons=n_neurons,
         n_sync_sets=n_sync_sets,
+        dropout_encoder=dropout_encoder,
+        dropout_attention=dropout_attention,
+        dropout_synapse=dropout_synapse,
+        dropout_nlm=dropout_nlm,
+        dropout_sync=dropout_sync,
+        dropout_output=dropout_output,
         data_dir=data_dir,
         output_dir=output_dir,
     )
@@ -1429,14 +2058,22 @@ def modal_entrypoint(
     epochs: int = 5,
     neurons: int = 64,
     sync_sets: int = 4,
+    dropout_encoder: float = 0.1,
+    dropout_attention: float = 0.1,
+    dropout_synapse: float = 0.1,
+    dropout_nlm: float = 0.1,
+    dropout_sync: float = 0.1,
+    dropout_output: float = 0.2,
 ):
     """
     Modal entrypoint for running training from command line.
     
     Usage:
         modal run ctm_extended.py --tasks "fashion_fine,cifar_fine" --epochs 10
+        modal run ctm_extended.py --dropout-encoder 0.2 --dropout-output 0.3
     """
-    selected_tasks = [t.strip() for t in tasks.split(',')]
+    # Parse tasks: handle both comma-separated and space-separated formats
+    selected_tasks = [t.strip() for t in tasks.replace(',', ' ').split() if t.strip()]
     
     # Validate tasks
     for task in selected_tasks:
@@ -1450,6 +2087,9 @@ def modal_entrypoint(
     print(f'Epochs: {epochs}')
     print(f'Neurons: {neurons}')
     print(f'Sync sets: {sync_sets}')
+    print(f'Dropout - encoder: {dropout_encoder}, attention: {dropout_attention}')
+    print(f'Dropout - synapse: {dropout_synapse}, nlm: {dropout_nlm}')
+    print(f'Dropout - sync: {dropout_sync}, output: {dropout_output}')
     print(f'{"="*60}\n')
     
     # Run training on Modal GPU
@@ -1458,6 +2098,12 @@ def modal_entrypoint(
         epochs=epochs,
         n_neurons=neurons,
         n_sync_sets=sync_sets,
+        dropout_encoder=dropout_encoder,
+        dropout_attention=dropout_attention,
+        dropout_synapse=dropout_synapse,
+        dropout_nlm=dropout_nlm,
+        dropout_sync=dropout_sync,
+        dropout_output=dropout_output,
     )
     
     print(f'\n{"="*60}')
@@ -1483,24 +2129,27 @@ Available tasks:
   cifar_coarse     - CIFAR-10 coarse (animal vs vehicle)
   fashion_fine     - Fashion MNIST classification (10 classes)
   emnist_fine      - EMNIST balanced classification (47 classes)
+  speech_commands  - Speech Commands (35 spoken words, audio)
+  wine_type        - Wine classification (3 types, tabular)
 
 Examples (local):
-  py ctm_extended.py --tasks fashion_fine emnist_fine cifar_fine
-  py ctm_extended.py --tasks mnist_digit cifar_fine --sync_sets 8
-  py ctm_extended.py --tasks fashion_fine emnist_fine cifar_fine --epochs 10 --neurons 64
+  py ctm_extended.py --tasks "fashion_fine emnist_fine cifar_fine"
+  py ctm_extended.py --tasks "fashion_fine,emnist_fine,cifar_fine"
+  py ctm_extended.py --tasks "mnist_digit cifar_fine" --sync_sets 8
+  py ctm_extended.py --tasks "fashion_fine speech_commands wine_type" --epochs 10
 
 Examples (Modal cloud GPU):
   modal run ctm_extended.py --tasks "fashion_fine,cifar_fine" --epochs 10
+  modal run ctm_extended.py --tasks "fashion_fine,speech_commands,wine_type" --epochs 5
   modal run ctm_extended.py --tasks "mnist_digit,cifar_fine" --neurons 128
         """
     )
     
     parser.add_argument(
         '--tasks',
-        nargs='+',
-        choices=list(ALL_TASKS.keys()),
-        default=['fashion_fine', 'emnist_fine', 'cifar_fine'],
-        help='Tasks to train on (default: fashion_fine emnist_fine cifar_fine)'
+        type=str,
+        default='fashion_fine,emnist_fine,cifar_fine',
+        help='Tasks to train on (comma-separated or space-separated, default: fashion_fine,emnist_fine,cifar_fine)'
     )
     
     parser.add_argument(
@@ -1538,15 +2187,76 @@ Examples (Modal cloud GPU):
         help='Modal GPU type (default: T4). Only used with --modal flag'
     )
     
+    # Dropout arguments
+    parser.add_argument(
+        '--dropout_encoder',
+        type=float,
+        default=0.1,
+        help='Dropout in Perceiver encoder (default: 0.1)'
+    )
+    
+    parser.add_argument(
+        '--dropout_attention',
+        type=float,
+        default=0.1,
+        help='Dropout in multi-head attention (default: 0.1)'
+    )
+    
+    parser.add_argument(
+        '--dropout_synapse',
+        type=float,
+        default=0.1,
+        help='Dropout after synapse model (default: 0.1)'
+    )
+    
+    parser.add_argument(
+        '--dropout_nlm',
+        type=float,
+        default=0.1,
+        help='Dropout after neuron-level models (default: 0.1)'
+    )
+    
+    parser.add_argument(
+        '--dropout_sync',
+        type=float,
+        default=0.1,
+        help='Dropout after synchronization (default: 0.1)'
+    )
+    
+    parser.add_argument(
+        '--dropout_output',
+        type=float,
+        default=0.1,
+        help='Dropout in output projectors (default: 0.2)'
+    )
+    
     args = parser.parse_args()
     
-    if not args.tasks:
+    # Parse tasks: handle both comma-separated and space-separated formats
+    if isinstance(args.tasks, str):
+        # Split by comma or space
+        tasks_list = [t.strip() for t in args.tasks.replace(',', ' ').split() if t.strip()]
+    else:
+        tasks_list = args.tasks
+    
+    # Validate tasks
+    valid_tasks = list(ALL_TASKS.keys())
+    invalid_tasks = [t for t in tasks_list if t not in valid_tasks]
+    if invalid_tasks:
+        print(f"Error: Invalid tasks: {invalid_tasks}")
+        print(f"Valid tasks: {', '.join(valid_tasks)}")
+        return
+    
+    if not tasks_list:
         print("Error: At least one task must be selected")
         return
     
-    if len(args.tasks) != len(set(args.tasks)):
+    if len(tasks_list) != len(set(tasks_list)):
         print("Error: Duplicate tasks detected")
         return
+    
+    # Replace args.tasks with parsed list
+    args.tasks = tasks_list
     
     if args.modal:
         # Run on Modal cloud
@@ -1558,6 +2268,9 @@ Examples (Modal cloud GPU):
         print(f'Epochs: {args.epochs}')
         print(f'Neurons: {args.neurons}')
         print(f'Sync sets: {args.sync_sets}')
+        print(f'Dropout - encoder: {args.dropout_encoder}, attention: {args.dropout_attention}')
+        print(f'Dropout - synapse: {args.dropout_synapse}, nlm: {args.dropout_nlm}')
+        print(f'Dropout - sync: {args.dropout_sync}, output: {args.dropout_output}')
         
         # Dynamically update GPU type if different from default
         with modal_app.run():
@@ -1566,6 +2279,12 @@ Examples (Modal cloud GPU):
                 epochs=args.epochs,
                 n_neurons=args.neurons,
                 n_sync_sets=args.sync_sets,
+                dropout_encoder=args.dropout_encoder,
+                dropout_attention=args.dropout_attention,
+                dropout_synapse=args.dropout_synapse,
+                dropout_nlm=args.dropout_nlm,
+                dropout_sync=args.dropout_sync,
+                dropout_output=args.dropout_output,
             )
         
         print(f'\n{"="*60}')
@@ -1582,6 +2301,9 @@ Examples (Modal cloud GPU):
         print(f'Epochs: {args.epochs}')
         print(f'Neurons: {args.neurons}')
         print(f'Sync sets: {args.sync_sets}')
+        print(f'Dropout - encoder: {args.dropout_encoder}, attention: {args.dropout_attention}')
+        print(f'Dropout - synapse: {args.dropout_synapse}, nlm: {args.dropout_nlm}')
+        print(f'Dropout - sync: {args.dropout_sync}, output: {args.dropout_output}')
         
         train_combined(
             device=device, 
@@ -1589,6 +2311,12 @@ Examples (Modal cloud GPU):
             epochs=args.epochs, 
             n_neurons=args.neurons, 
             n_sync_sets=args.sync_sets,
+            dropout_encoder=args.dropout_encoder,
+            dropout_attention=args.dropout_attention,
+            dropout_synapse=args.dropout_synapse,
+            dropout_nlm=args.dropout_nlm,
+            dropout_sync=args.dropout_sync,
+            dropout_output=args.dropout_output,
         )
     
     print('\n' + '='*60)
