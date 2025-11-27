@@ -1763,6 +1763,15 @@ def train_combined(
     dropout_nlm: float,
     dropout_sync: float,
     dropout_output: float,
+    max_memory: int = 10,
+    max_ticks: int = 15,
+    n_representation_size: int = 32,
+    n_synch_out: int = 32,
+    n_synch_action: int = 16,
+    n_attention_heads: int = 4,
+    load_balance_coef: float = 0.0,
+    learning_rate: float = 0.001,
+    batch_size: int = 64,
     data_dir: str = './data',
     output_dir: str = '.',
 ) -> tuple:
@@ -1807,15 +1816,15 @@ def train_combined(
             "epochs": epochs,
             "n_neurons": n_neurons,
             "n_sync_sets": n_sync_sets,
-            "max_memory": 10,
-            "max_ticks": 15,
-            "n_representation_size": 32,
-            "n_synch_out": 32,
-            "n_synch_action": 16,
-            "n_attention_heads": 4,
-            "load_balance_coef": 0.0,
-            "learning_rate": 0.001,
-            "batch_size": 64,
+            "max_memory": max_memory,
+            "max_ticks": max_ticks,
+            "n_representation_size": n_representation_size,
+            "n_synch_out": n_synch_out,
+            "n_synch_action": n_synch_action,
+            "n_attention_heads": n_attention_heads,
+            "load_balance_coef": load_balance_coef,
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
             "dropout_encoder": dropout_encoder,
             "dropout_attention": dropout_attention,
             "dropout_synapse": dropout_synapse,
@@ -1885,8 +1894,8 @@ def train_combined(
             mnist_test, cifar_test, fashion_test, emnist_test, speech_commands_test, wine_test
         )
         
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=custom_collate_fn)
-        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=custom_collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
         
         all_task_order = ['mnist_digit', 'mnist_even_odd', 'cifar_fine', 'cifar_coarse', 'fashion_fine', 'emnist_fine', 'speech_commands', 'wine_type']
         task_names = selected_tasks
@@ -1903,15 +1912,15 @@ def train_combined(
         
         model = MultitaskGatedCTM(
             n_neurons=n_neurons,
-            max_memory=10, 
-            max_ticks=15, 
-            n_representation_size=32,
-            n_synch_out=32,
-            n_synch_action=16,
-            n_attention_heads=4,
+            max_memory=max_memory, 
+            max_ticks=max_ticks, 
+            n_representation_size=n_representation_size,
+            n_synch_out=n_synch_out,
+            n_synch_action=n_synch_action,
+            n_attention_heads=n_attention_heads,
             task_output_sizes=task_output_sizes,
             n_sync_sets=n_sync_sets,
-            load_balance_coef=0.0,  # Disabled to test if gates differentiate without balance pressure
+            load_balance_coef=load_balance_coef,
             dropout_encoder=dropout_encoder,
             dropout_attention=dropout_attention,
             dropout_synapse=dropout_synapse,
@@ -1926,7 +1935,7 @@ def train_combined(
         
         print_model_info(model)
         
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         
         metrics = train_multitask_gated_model(
             model=model,
