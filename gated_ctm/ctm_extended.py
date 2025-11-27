@@ -12,6 +12,7 @@ import math
 import os
 import contextlib
 import wave
+import time
 
 # Audio processing
 import torchaudio
@@ -442,6 +443,63 @@ class PerceiverEncoder(nn.Module):
         return output
 
 
+class BatchedNLM(nn.Module):
+    """
+    Batched Neuron-Level Model with per-neuron private parameters (paper-faithful).
+    
+    Each neuron has its own unique weight parameters as specified in CTM paper
+    Section 3.3 "Privately-Parameterized Neuron-Level Models". Uses einsum for
+    efficient batched matrix multiplication across all neurons in parallel.
+    
+    Architecture per neuron: Linear(memory, 256) -> GLU -> Linear(128, 1)
+    
+    Reference: https://arxiv.org/abs/2505.05522
+    """
+    
+    def __init__(self, n_neurons: int, max_memory: int):
+        super(BatchedNLM, self).__init__()
+        self.n_neurons = n_neurons
+        self.max_memory = max_memory
+        
+        # Per-neuron weights for fc1: each neuron has its own (max_memory -> 256) projection
+        # Shape: (n_neurons, max_memory, 256) - 256 because GLU halves it to 128
+        self.fc1_weight = nn.Parameter(
+            torch.randn(n_neurons, max_memory, 256) * math.sqrt(2.0 / max_memory)
+        )
+        self.fc1_bias = nn.Parameter(torch.zeros(n_neurons, 256))
+        
+        # Per-neuron weights for fc2: each neuron has its own (128 -> 1) projection
+        # Shape: (n_neurons, 128, 1)
+        self.fc2_weight = nn.Parameter(
+            torch.randn(n_neurons, 128, 1) * math.sqrt(2.0 / 128)
+        )
+        self.fc2_bias = nn.Parameter(torch.zeros(n_neurons, 1))
+    
+    def forward(self, state_trace: torch.Tensor) -> torch.Tensor:
+        """
+        Process all neuron traces in parallel with per-neuron private weights.
+        
+        Args:
+            state_trace: (batch, neurons, memory) tensor of neuron activation histories
+        
+        Returns:
+            (batch, neurons) post-activations for all neurons
+        """
+        # fc1: (B, N, M) @ (N, M, 256) -> (B, N, 256)
+        # einsum performs batched matmul where each neuron uses its own weights
+        x = torch.einsum('bnm,nmh->bnh', state_trace, self.fc1_weight) + self.fc1_bias
+        
+        # GLU activation: splits last dim in half, applies sigmoid gate
+        # (B, N, 256) -> (B, N, 128)
+        x = F.glu(x, dim=-1)
+        
+        # fc2: (B, N, 128) @ (N, 128, 1) -> (B, N, 1)
+        x = torch.einsum('bnh,nho->bno', x, self.fc2_weight) + self.fc2_bias
+        
+        # Squeeze output dimension: (B, N, 1) -> (B, N)
+        return x.squeeze(-1)
+
+
 class MultitaskGatedCTM(nn.Module):
     """
     Multitask Gated Synchronization Continuous Thought Machine.
@@ -552,15 +610,8 @@ class MultitaskGatedCTM(nn.Module):
             nn.LayerNorm(n_neurons),
         )
 
-        # Neuron-level models (NLMs) - SHARED, each neuron has private params
-        self.neuron_level_models = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(max_memory, 128 * 2),
-                nn.GLU(),
-                nn.Linear(128, 1),
-            )
-            for _ in range(n_neurons)
-        ])
+        # Batched Neuron-level model (NLM) - processes all neurons in parallel
+        self.batched_nlm = BatchedNLM(n_neurons=n_neurons, max_memory=max_memory)
 
         # Initialize multiple sets of synchronization pairs - SHARED gating
         self._init_synchronization_pair_sets()
@@ -813,14 +864,8 @@ class MultitaskGatedCTM(nn.Module):
             # Update state trace (FIFO buffer of pre-activations)
             state_trace = torch.cat([state_trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
             
-            # Apply neuron-level models to get post-activations
-            post_activations_list = []
-            for neuron_idx in range(self.n_neurons):
-                neuron_trace = state_trace[:, neuron_idx, :]
-                post_activation = self.neuron_level_models[neuron_idx](neuron_trace)
-                post_activations_list.append(post_activation)
-            
-            activated_state = torch.cat(post_activations_list, dim=-1)
+            # Apply batched neuron-level model to get post-activations (all neurons in parallel)
+            activated_state = self.batched_nlm(state_trace)
             activated_state = self.dropout_nlm(activated_state)
             
             # Calculate gated synchronization for output predictions
@@ -1181,6 +1226,9 @@ def train_multitask_gated_model(
         total_balance_loss = 0.0
         balance_count = 0
         
+        epoch_start_time = time.time()
+        last_checkpoint_time = epoch_start_time
+        
         for batch_idx, (stacked_data, labels, sources, batch_indices) in enumerate(train_loader):
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -1234,9 +1282,13 @@ def train_multitask_gated_model(
                 balance_count += 1
             
             if batch_idx % 25 == 0:
+                current_time = time.time()
+                elapsed_time = current_time - last_checkpoint_time
                 avg_balance = batch_balance_loss.item() / max(1, sum(1 for d in dataset_task_indices if stacked_data[d] is not None))
                 print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
-                      f'Total Loss: {total_loss.item():.4f}, Balance: {avg_balance:.4f}')
+                      f'Total Loss: {total_loss.item():.4f}, Balance: {avg_balance:.4f}, '
+                      f'Time: {elapsed_time:.2f}s')
+                last_checkpoint_time = current_time
             
             # Gate inspection at batch 100
             if batch_idx % 500 == 0:
@@ -1720,7 +1772,7 @@ def print_model_info(model: MultitaskGatedCTM):
     
     print(f'\nShared components:')
     shared = ['perceiver_encoder', 'kv_proj', 'q_proj', 'attention', 'synapse_model', 
-              'neuron_level_models', 'gate_network_action', 'gate_network_out']
+              'batched_nlm', 'gate_network_action', 'gate_network_out']
     for name in shared:
         if hasattr(model, name):
             module = getattr(model, name)
@@ -1935,7 +1987,7 @@ def train_combined(
         
         print_model_info(model)
         
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
         
         metrics = train_multitask_gated_model(
             model=model,
