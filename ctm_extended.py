@@ -22,6 +22,63 @@ def compute_normalized_entropy(predictions: torch.Tensor) -> torch.Tensor:
     return normalized_entropy
 
 
+class BatchedNLM(nn.Module):
+    """
+    Batched Neuron-Level Model with per-neuron private parameters (paper-faithful).
+    
+    Each neuron has its own unique weight parameters as specified in CTM paper
+    Section 3.3 "Privately-Parameterized Neuron-Level Models". Uses einsum for
+    efficient batched matrix multiplication across all neurons in parallel.
+    
+    Architecture per neuron: Linear(memory, 256) -> GLU -> Linear(128, 1)
+    
+    Reference: https://arxiv.org/abs/2505.05522
+    """
+    
+    def __init__(self, n_neurons: int, max_memory: int):
+        super(BatchedNLM, self).__init__()
+        self.n_neurons = n_neurons
+        self.max_memory = max_memory
+        
+        # Per-neuron weights for fc1: each neuron has its own (max_memory -> 256) projection
+        # Shape: (n_neurons, max_memory, 256) - 256 because GLU halves it to 128
+        self.fc1_weight = nn.Parameter(
+            torch.randn(n_neurons, max_memory, 256) * math.sqrt(2.0 / max_memory)
+        )
+        self.fc1_bias = nn.Parameter(torch.zeros(n_neurons, 256))
+        
+        # Per-neuron weights for fc2: each neuron has its own (128 -> 1) projection
+        # Shape: (n_neurons, 128, 1)
+        self.fc2_weight = nn.Parameter(
+            torch.randn(n_neurons, 128, 1) * math.sqrt(2.0 / 128)
+        )
+        self.fc2_bias = nn.Parameter(torch.zeros(n_neurons, 1))
+    
+    def forward(self, state_trace: torch.Tensor) -> torch.Tensor:
+        """
+        Process all neuron traces in parallel with per-neuron private weights.
+        
+        Args:
+            state_trace: (batch, neurons, memory) tensor of neuron activation histories
+        
+        Returns:
+            (batch, neurons) post-activations for all neurons
+        """
+        # fc1: (B, N, M) @ (N, M, 256) -> (B, N, 256)
+        # einsum performs batched matmul where each neuron uses its own weights
+        x = torch.einsum('bnm,nmh->bnh', state_trace, self.fc1_weight) + self.fc1_bias
+        
+        # GLU activation: splits last dim in half, applies sigmoid gate
+        # (B, N, 256) -> (B, N, 128)
+        x = F.glu(x, dim=-1)
+        
+        # fc2: (B, N, 128) @ (N, 128, 1) -> (B, N, 1)
+        x = torch.einsum('bnh,nho->bno', x, self.fc2_weight) + self.fc2_bias
+        
+        # Squeeze output dimension: (B, N, 1) -> (B, N)
+        return x.squeeze(-1)
+
+
 class SimplifiedCTM(nn.Module):
     """
     Simplified Continuous Thought Machine implementation.
@@ -114,17 +171,9 @@ class SimplifiedCTM(nn.Module):
             nn.LayerNorm(n_neurons),
         )
 
-        # Neuron-level models (NLMs) - Section 3.3
-        # Each neuron has its own private MLP that processes its pre-activation history
-        # Using GLU nonlinearity as in official implementation
-        self.neuron_level_models = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(max_memory, 128 * 2),
-                nn.GLU(),
-                nn.Linear(128, 1),
-            )
-            for _ in range(n_neurons)
-        ])
+        # Batched Neuron-level model (NLM) - processes all neurons in parallel
+        # Each neuron has its own private parameters as specified in CTM paper Section 3.3
+        self.batched_nlm = BatchedNLM(n_neurons=n_neurons, max_memory=max_memory)
 
         # Synchronization neuron pairs - Section 3.4.1 (random-pairing strategy)
         # Separate pairs for output and action as per paper
@@ -307,14 +356,8 @@ class SimplifiedCTM(nn.Module):
             # Update state trace (FIFO buffer of pre-activations)
             state_trace = torch.cat([state_trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
             
-            # Apply neuron-level models to get post-activations
-            post_activations_list = []
-            for neuron_idx in range(self.n_neurons):
-                neuron_trace = state_trace[:, neuron_idx, :]  # (batch_size, max_memory)
-                post_activation = self.neuron_level_models[neuron_idx](neuron_trace)  # (batch_size, 1)
-                post_activations_list.append(post_activation)
-            
-            activated_state = torch.cat(post_activations_list, dim=-1)  # (batch_size, n_neurons)
+            # Apply batched neuron-level model to get post-activations (all neurons in parallel)
+            activated_state = self.batched_nlm(state_trace)  # (batch_size, n_neurons)
             
             # Calculate synchronization for output predictions
             sync_out, decay_alpha_out, decay_beta_out = self.compute_synchronization(
