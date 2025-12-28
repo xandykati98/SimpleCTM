@@ -482,6 +482,9 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
             track=True
         )
     
+    # Calculate class probabilities
+    probs = F.softmax(predictions, dim=1)
+    
     # attention shape: (n_ticks, batch, n_heads, 1, n_patches)
     attention = attention[:, 0, :, 0, :]  # (n_ticks, n_heads, n_patches)
     
@@ -489,10 +492,10 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     attention_avg = attention.mean(axis=1)  # (n_ticks, n_patches)
     
     grid_size = int(np.sqrt(model.n_patches))
-    n_ticks_to_show = min(8, model.max_ticks)
-    tick_indices = np.linspace(0, model.max_ticks - 1, n_ticks_to_show, dtype=int)
+    n_ticks_to_show = model.max_ticks
+    tick_indices = np.arange(model.max_ticks)
     
-    fig, axes = plt.subplots(2, n_ticks_to_show, figsize=(2 * n_ticks_to_show, 4))
+    fig, axes = plt.subplots(3, n_ticks_to_show, figsize=(2 * n_ticks_to_show, 6))
     
     # Show original image
     img_np = image.squeeze().cpu().numpy()
@@ -505,12 +508,21 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
         axes[0, i].set_title(f'Tick {tick_idx}')
         axes[0, i].axis('off')
         
-        # Bottom row: just attention heatmap
+        # Middle row: just attention heatmap
         axes[1, i].imshow(attn_map, cmap='hot')
         axes[1, i].set_title(f'Attn')
         axes[1, i].axis('off')
+        
+        # Bottom row: class probabilities
+        tick_probs = probs[0, :, tick_idx].cpu().numpy()
+        axes[2, i].bar(range(model.out_dims), tick_probs)
+        axes[2, i].set_ylim(0, 1)
+        axes[2, i].set_title(f'Pred: {tick_probs.argmax()}')
+        axes[2, i].set_xticks([])
+        if i > 0:
+            axes[2, i].set_yticks([])
     
-    plt.suptitle('Foveated Attention Over Ticks')
+    plt.suptitle('Foveated Attention and Predictions Over Ticks')
     plt.tight_layout()
     plt.savefig('attention_visualization.png', dpi=150)
     plt.show()
