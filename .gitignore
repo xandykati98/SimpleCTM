@@ -2,3 +2,7 @@ data
 venv
 __pycache__
 mlflow.db
+cache*
+dna_*.png
+
+*.pth

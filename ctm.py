@@ -137,6 +137,52 @@ class PatchEmbedding(nn.Module):
         return x
 
 
+class PatchEmbedding1D(nn.Module):
+    """
+    Split 1D input into patches and embed them.
+
+    Expected input shape: (B, C, L)
+    Output shape: (B, n_patches, embed_dim)
+    """
+
+    def __init__(self, input_length: int, patch_size: int, in_channels: int, embed_dim: int):
+        super(PatchEmbedding1D, self).__init__()
+        self.input_length = input_length
+        self.patch_size = patch_size
+        self.n_patches = input_length // patch_size
+
+        if self.n_patches < 1:
+            raise ValueError(
+                f"Invalid 1D patching: input_length={input_length}, patch_size={patch_size} -> n_patches={self.n_patches}"
+            )
+
+        # Conv1d with kernel_size=stride=patch_size acts as patch extraction + linear projection
+        self.proj = nn.Conv1d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, L) input sequence/features
+        Returns:
+            (B, n_patches, embed_dim) patch embeddings
+        """
+        if x.dim() != 3:
+            raise ValueError(f"PatchEmbedding1D expects input of shape (B, C, L), got shape={tuple(x.shape)}")
+
+        # (B, C, L) -> (B, embed_dim, n_patches)
+        x = self.proj(x)
+        # (B, embed_dim, n_patches) -> (B, n_patches, embed_dim)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
 class LearnablePositionalEmbedding(nn.Module):
     """
     Learnable 2D positional embeddings for patches.
@@ -181,6 +227,7 @@ class SimplifiedCTM(nn.Module):
         image_size: int,
         patch_size: int,
         in_channels: int,
+        input_ndim: int = 2,
         dropout: float = 0.0,
         dropout_nlm: float = 0.0,
     ):
@@ -195,7 +242,18 @@ class SimplifiedCTM(nn.Module):
         self.n_attention_heads = n_attention_heads
         self.patch_size = patch_size
         self.image_size = image_size
-        self.n_patches = (image_size // patch_size) ** 2
+        self.input_ndim = input_ndim
+
+        if self.input_ndim == 2:
+            self.n_patches = (image_size // patch_size) ** 2
+        elif self.input_ndim == 1:
+            self.n_patches = image_size // patch_size
+            if self.n_patches < 1:
+                raise ValueError(
+                    f"Invalid 1D patching: image_size(input_length)={image_size}, patch_size={patch_size} -> n_patches={self.n_patches}"
+                )
+        else:
+            raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
         
         # Learnable initial states (Section 3.1 - start states)
         self.register_parameter(
@@ -213,12 +271,20 @@ class SimplifiedCTM(nn.Module):
             ))
         )
 
-        self.patch_embed = PatchEmbedding(
-            image_size=image_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=d_input
-        )
+        if self.input_ndim == 2:
+            self.patch_embed = PatchEmbedding(
+                image_size=image_size,
+                patch_size=patch_size,
+                in_channels=in_channels,
+                embed_dim=d_input,
+            )
+        else:
+            self.patch_embed = PatchEmbedding1D(
+                input_length=image_size,
+                patch_size=patch_size,
+                in_channels=in_channels,
+                embed_dim=d_input,
+            )
         
         # Positional embeddings help model understand patch locations
         self.pos_embed = LearnablePositionalEmbedding(
@@ -474,6 +540,9 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     This shows the foveated attention behavior!
     """
     import matplotlib.pyplot as plt
+
+    if model.input_ndim != 2:
+        raise ValueError("visualize_attention currently supports only 2D image inputs (input_ndim=2).")
     
     model.eval()
     with torch.no_grad():
@@ -618,8 +687,16 @@ def print_model_info(model: SimplifiedCTM):
     print(f'Number of neurons: {model.n_neurons}')
     print(f'Memory length: {model.max_memory}')
     print(f'Max ticks: {model.max_ticks}')
-    print(f'Number of patches: {model.n_patches} ({model.image_size//model.patch_size}x{model.image_size//model.patch_size})')
-    print(f'Patch size: {model.patch_size}x{model.patch_size}')
+    if model.input_ndim == 2:
+        print(f'Input ndim: 2')
+        print(f'Image size: {model.image_size}x{model.image_size}')
+        print(f'Number of patches: {model.n_patches} ({model.image_size//model.patch_size}x{model.image_size//model.patch_size})')
+        print(f'Patch size: {model.patch_size}x{model.patch_size}')
+    else:
+        print(f'Input ndim: 1')
+        print(f'Sequence length: {model.image_size}')
+        print(f'Number of patches: {model.n_patches}')
+        print(f'Patch size: {model.patch_size}')
     print(f'Sync pairs (output): {model.n_synch_out}')
     print(f'Sync pairs (action): {model.n_synch_action}')
     print(f'Attention heads: {model.n_attention_heads}')
