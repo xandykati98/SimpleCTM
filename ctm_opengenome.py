@@ -268,12 +268,12 @@ def visualize_dna_attention(
     print(f"  Saved dna_attention_epoch_{epoch}.png")
 
 
-def load_opengenome_stage2(max_seq_length: int, use_cache: bool) -> tuple:
+def load_opengenome_stage2(max_seq_length: int, use_cache: bool, data_path: str = "D:/huggingface/datasets") -> tuple:
     """Load LongSafari/open-genome stage2 train/validation/test splits, filtered to target families and length."""
     from datasets import Dataset
     
     # Set cache directory to D: drive
-    cache_dir = "D:/huggingface/datasets"
+    cache_dir = data_path
     os.makedirs(cache_dir, exist_ok=True)
     
     # Path for the processed/filtered dataset cache
@@ -498,7 +498,7 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main():
+def main(data_path: str):
     # Config
     seq_length = 8192
     patch_size = 32
@@ -525,6 +525,7 @@ def main():
     train_hf, val_hf, test_hf = load_opengenome_stage2(
         max_seq_length=seq_length,
         use_cache=use_cached_dataset,
+        data_path=data_path,
     )
     
     # If validation/test sets are empty, split training data

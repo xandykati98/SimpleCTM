@@ -128,9 +128,9 @@ class Conv1DGenomeClassifier(nn.Module):
         return x
 
 
-def load_cached_dataset(max_seq_length: int) -> tuple:
+def load_cached_dataset(max_seq_length: int, data_path: str = "D:/huggingface/datasets") -> tuple:
     """Load the cached filtered dataset."""
-    cache_dir = "D:/huggingface/datasets"
+    cache_dir = data_path
     filtered_cache_dir = os.path.join(cache_dir, f"opengenome_filtered_maxlen{max_seq_length}")
     train_cache = os.path.join(filtered_cache_dir, "train")
     val_cache = os.path.join(filtered_cache_dir, "validation")
@@ -231,7 +231,7 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main():
+def main(data_path: str):
     # Config
     seq_length = 8192
     batch_size = 32  # Can be larger since Conv1D is simpler
@@ -249,7 +249,7 @@ def main():
     print(f"Device: {device}")
     
     # Load cached data
-    train_hf, val_hf, test_hf = load_cached_dataset(max_seq_length=seq_length)
+    train_hf, val_hf, test_hf = load_cached_dataset(max_seq_length=seq_length, data_path=data_path)
     
     # Split training data if val/test empty
     if len(val_hf) == 0 or len(test_hf) == 0:
