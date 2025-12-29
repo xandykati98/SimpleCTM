@@ -6,3 +6,4 @@ cache*
 dna_*.png
 
 *.pth
+wandb/

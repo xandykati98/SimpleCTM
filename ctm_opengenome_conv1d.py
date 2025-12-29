@@ -14,6 +14,7 @@ from collections import Counter
 from typing import List
 from datasets import Dataset
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
+import wandb
 
 # DNA encoding
 DNA_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
@@ -231,7 +232,7 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main(data_path: str):
+def main(data_path: str = "D:/huggingface/datasets"):
     # Config
     seq_length = 8192
     batch_size = 32  # Can be larger since Conv1D is simpler
@@ -304,6 +305,29 @@ def main(data_path: str):
     class_weights = compute_class_weights(train_hf, num_classes, power=class_weight_power).to(device)
     print(f"Class weights (power={class_weight_power}): {class_weights.cpu().numpy().round(2)}")
     
+    # Initialize wandb
+    wandb.init(
+        project="opengenome",
+        name=f"conv1d_seq{seq_length}_ep{epochs}",
+        config={
+            "seq_length": seq_length,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "lr": lr,
+            "embedding_dim": embedding_dim,
+            "num_filters": num_filters,
+            "kernel_sizes": kernel_sizes,
+            "dropout": dropout,
+            "class_weight_power": class_weight_power,
+            "num_classes": num_classes,
+            "total_params": total_params,
+            "train_size": len(train_hf),
+            "val_size": len(val_hf),
+            "test_size": len(test_hf),
+            "device": str(device),
+        }
+    )
+    
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -328,13 +352,36 @@ def main(data_path: str):
             print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}%")
             print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.2f}%, F1={f1:.4f}")
             
+            # Log metrics to wandb
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "val/f1_macro": f1,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "epoch_time": elapsed,
+            })
+            
             if f1 > best_val_f1:
                 best_val_f1 = f1
                 torch.save(model.state_dict(), "conv1d_best_model.pth")
+                wandb.run.summary["best_val_f1"] = f1
+                wandb.run.summary["best_epoch"] = epoch + 1
                 print(f"  New best model saved! (F1={f1:.4f})")
         else:
             elapsed = time.time() - start
             print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}%")
+            
+            # Log metrics to wandb (no validation)
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "epoch_time": elapsed,
+            })
         
         print(f"  Time: {elapsed:.1f}s")
         scheduler.step()
@@ -350,21 +397,56 @@ def main(data_path: str):
     
     if len(test_loader) > 0:
         test_loss, test_acc, test_preds, test_labels = evaluate(model, test_loader, criterion, device)
+        test_f1 = f1_score(test_labels, test_preds, average='macro', zero_division=0)
         print(f"\nTest: Loss={test_loss:.4f}, Acc={test_acc:.2f}%")
+        
+        # Log test metrics
+        wandb.log({
+            "test/loss": test_loss,
+            "test/accuracy": test_acc,
+            "test/f1_macro": test_f1,
+        })
+        wandb.run.summary["test_loss"] = test_loss
+        wandb.run.summary["test_accuracy"] = test_acc
+        wandb.run.summary["test_f1_macro"] = test_f1
         
         if len(test_labels) > 0:
             target_names = [IDX_TO_FAMILY[i] for i in range(num_classes)]
             print("\nClassification Report:")
+            report = classification_report(test_labels, test_preds, target_names=target_names, zero_division=0, output_dict=True)
             print(classification_report(test_labels, test_preds, target_names=target_names, zero_division=0))
             
+            # Log per-class metrics
+            for family in target_names:
+                if family in report:
+                    wandb.log({
+                        f"test/{family}_precision": report[family]['precision'],
+                        f"test/{family}_recall": report[family]['recall'],
+                        f"test/{family}_f1": report[family]['f1-score'],
+                    })
+            
             print("\nConfusion Matrix:")
-            print(confusion_matrix(test_labels, test_preds))
+            cm = confusion_matrix(test_labels, test_preds)
+            print(cm)
+            
+            # Log confusion matrix using wandb.plot
+            wandb.log({
+                "confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=test_labels,
+                    preds=test_preds,
+                    class_names=target_names,
+                )
+            })
     else:
         print("Test set is empty - skipping evaluation.")
     
     # Save final model
     torch.save(model.state_dict(), "conv1d_genome_model.pth")
     print("\nFinal model saved to conv1d_genome_model.pth")
+    
+    # Finish wandb run
+    wandb.finish()
 
 
 if __name__ == "__main__":

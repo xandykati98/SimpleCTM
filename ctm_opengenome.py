@@ -14,6 +14,7 @@ from typing import Dict, List
 from datasets import load_dataset, concatenate_datasets, DownloadConfig
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
 from ctm import SimplifiedCTM, print_model_info
+import wandb
 
 # Enable HuggingFace datasets progress bars
 os.environ["HF_DATASETS_VERBOSE"] = "1"
@@ -503,7 +504,7 @@ def evaluate(
 def main(data_path: str = "D:/huggingface/datasets"):
     # Config
     seq_length = 8192
-    patch_size = 4
+    patch_size = 16
     batch_size = 16
     epochs = 10
     lr = 0.001
@@ -511,13 +512,13 @@ def main(data_path: str = "D:/huggingface/datasets"):
     
     # CTM config
     n_neurons = 128
-    max_memory = 6
-    max_ticks = 8
-    d_input = 128
-    n_synch_out = 64
+    max_memory = 4
+    max_ticks = 4
+    d_input = 64
+    n_synch_out = 32
     n_synch_action = 32
     n_attention_heads = 4
-    nucleotide_embedding_dim = 16
+    nucleotide_embedding_dim = 8
     dropout = 0.1
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -581,6 +582,37 @@ def main(data_path: str = "D:/huggingface/datasets"):
     
     print_model_info(model.ctm)
     
+    # Compute total parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Initialize wandb
+    wandb.init(
+        project="opengenome",
+        name=f"ctm_seq{seq_length}_ep{epochs}",
+        config={
+            "seq_length": seq_length,
+            "patch_size": patch_size,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "lr": lr,
+            "n_neurons": n_neurons,
+            "max_memory": max_memory,
+            "max_ticks": max_ticks,
+            "d_input": d_input,
+            "n_synch_out": n_synch_out,
+            "n_synch_action": n_synch_action,
+            "n_attention_heads": n_attention_heads,
+            "nucleotide_embedding_dim": nucleotide_embedding_dim,
+            "dropout": dropout,
+            "num_classes": num_classes,
+            "total_params": total_params,
+            "train_size": len(train_hf),
+            "val_size": len(val_hf),
+            "test_size": len(test_hf),
+            "device": str(device),
+        }
+    )
+    
     # Class weights & optimizer
     alpha_weights = compute_class_weights(train_hf, num_classes, power=0.5).to(device)
     print(f"\nClass weights: {alpha_weights.cpu().numpy()}")
@@ -598,6 +630,8 @@ def main(data_path: str = "D:/huggingface/datasets"):
     np.random.seed(42)
     vis_indices = np.random.choice(len(train_ds), size=epochs, replace=False)
     
+    best_val_f1 = 0.0
+    
     for epoch in range(epochs):
         start = time.time()
         
@@ -610,10 +644,37 @@ def main(data_path: str = "D:/huggingface/datasets"):
             elapsed = time.time() - start
             print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}%")
             print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.2f}%, F1={f1:.4f}")
+            
+            # Log metrics to wandb
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "val/f1_macro": f1,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "epoch_time": elapsed,
+            })
+            
+            # Track best validation F1
+            if f1 > best_val_f1:
+                best_val_f1 = f1
+                wandb.run.summary["best_val_f1"] = f1
+                wandb.run.summary["best_epoch"] = epoch + 1
         else:
             elapsed = time.time() - start
             print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}%")
             print(f"  Val:   Skipped (empty)")
+            
+            # Log metrics to wandb (no validation)
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "epoch_time": elapsed,
+            })
         print(f"  Time: {elapsed:.1f}s")
         
         # Visualize attention with a different sample each epoch
@@ -628,6 +689,13 @@ def main(data_path: str = "D:/huggingface/datasets"):
             seq_length=seq_length,
             grid_width=vis_grid_width,
         )
+        
+        # Log attention visualization image to wandb
+        vis_image_path = f'dna_attention_epoch_{epoch + 1}.png'
+        if os.path.exists(vis_image_path):
+            wandb.log({
+                "attention_visualization": wandb.Image(vis_image_path),
+            })
     
     # Final test evaluation
     print("\n" + "=" * 60)
@@ -636,15 +704,47 @@ def main(data_path: str = "D:/huggingface/datasets"):
     
     if len(test_loader) > 0:
         test_loss, test_acc, test_preds, test_labels = evaluate(model, test_loader, device)
+        test_f1 = f1_score(test_labels, test_preds, average='macro', zero_division=0) if len(test_labels) > 0 else 0.0
         print(f"\nTest: Loss={test_loss:.4f}, Acc={test_acc:.2f}%")
+        
+        # Log test metrics
+        wandb.log({
+            "test/loss": test_loss,
+            "test/accuracy": test_acc,
+            "test/f1_macro": test_f1,
+        })
+        wandb.run.summary["test_loss"] = test_loss
+        wandb.run.summary["test_accuracy"] = test_acc
+        wandb.run.summary["test_f1_macro"] = test_f1
         
         if len(test_labels) > 0:
             target_names = [IDX_TO_FAMILY[i] for i in range(num_classes)]
             print("\nClassification Report:")
+            report = classification_report(test_labels, test_preds, target_names=target_names, zero_division=0, output_dict=True)
             print(classification_report(test_labels, test_preds, target_names=target_names, zero_division=0))
             
+            # Log per-class metrics
+            for family in target_names:
+                if family in report:
+                    wandb.log({
+                        f"test/{family}_precision": report[family]['precision'],
+                        f"test/{family}_recall": report[family]['recall'],
+                        f"test/{family}_f1": report[family]['f1-score'],
+                    })
+            
             print("\nConfusion Matrix:")
-            print(confusion_matrix(test_labels, test_preds))
+            cm = confusion_matrix(test_labels, test_preds)
+            print(cm)
+            
+            # Log confusion matrix using wandb.plot
+            wandb.log({
+                "confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=test_labels,
+                    preds=test_preds,
+                    class_names=target_names,
+                )
+            })
         else:
             print("No test samples available for evaluation.")
     else:
@@ -653,6 +753,9 @@ def main(data_path: str = "D:/huggingface/datasets"):
     # Save
     torch.save(model.state_dict(), "opengenome_ctm_model.pth")
     print("\nModel saved to opengenome_ctm_model.pth")
+    
+    # Finish wandb run
+    wandb.finish()
 
 
 if __name__ == "__main__":
