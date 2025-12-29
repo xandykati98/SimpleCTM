@@ -71,7 +71,9 @@ class OpenGenomeDataset(torch.utils.data.Dataset):
         return len(self.data)
     
     def __getitem__(self, idx: int):
-        item = self.data[idx]
+        # HuggingFace datasets does not accept NumPy scalar indices (e.g., np.int32/np.int64).
+        idx_int = int(idx)
+        item = self.data[idx_int]
         sequence = extract_sequence(item["text"])
         encoded = encode_sequence(sequence, self.max_len)
         label = FAMILY_TO_IDX[item["family"]]
@@ -498,18 +500,18 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main(data_path: str):
+def main(data_path: str = "D:/huggingface/datasets"):
     # Config
     seq_length = 8192
-    patch_size = 32
+    patch_size = 4
     batch_size = 16
     epochs = 10
     lr = 0.001
     use_cached_dataset = True  # Set to False to force re-processing
     
     # CTM config
-    n_neurons = 256
-    max_memory = 12
+    n_neurons = 128
+    max_memory = 6
     max_ticks = 8
     d_input = 128
     n_synch_out = 64
