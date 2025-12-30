@@ -62,36 +62,51 @@ class BatchedNLM(nn.Module):
         # Learnable temperature parameter for scaling (paper Section 3.3)
         self.register_parameter('T', nn.Parameter(torch.ones(1)))
     
-    def forward(self, state_trace: torch.Tensor) -> torch.Tensor:
+    def forward(self, state_trace: torch.Tensor, track: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Process all neuron traces in parallel with per-neuron private weights.
         
         Args:
             state_trace: (batch, neurons, memory) tensor of neuron activation histories
+            track: If True, return intermediate activations for visualization
         
         Returns:
-            (batch, neurons) post-activations for all neurons
+            If track=False: (batch, neurons) post-activations for all neurons
+            If track=True: tuple of (post-activations, dict of intermediate activations)
         """
         # Apply dropout to input
-        x = self.dropout(state_trace)
+        x_input = self.dropout(state_trace)
         
         # fc1: (B, N, M) @ (N, M, 256) -> (B, N, 256)
         # einsum performs batched matmul where each neuron uses its own weights
-        x = torch.einsum('bnm,nmh->bnh', x, self.fc1_weight) + self.fc1_bias
+        x_fc1 = torch.einsum('bnm,nmh->bnh', x_input, self.fc1_weight) + self.fc1_bias
         
         # First GLU activation: splits last dim in half, applies sigmoid gate
         # (B, N, 256) -> (B, N, 128)
-        x = F.glu(x, dim=-1)
+        x_glu1 = F.glu(x_fc1, dim=-1)
         
         # fc2: (B, N, 128) @ (N, 128, 2) -> (B, N, 2)
-        x = torch.einsum('bnh,nho->bno', x, self.fc2_weight) + self.fc2_bias
+        x_fc2 = torch.einsum('bnh,nho->bno', x_glu1, self.fc2_weight) + self.fc2_bias
         
         # Second GLU: gates the output (learned confidence mechanism)
         # (B, N, 2) -> (B, N, 1)
-        x = F.glu(x, dim=-1)
+        x_glu2 = F.glu(x_fc2, dim=-1)
         
         # Apply temperature scaling and squeeze: (B, N, 1) -> (B, N)
-        return (x.squeeze(-1) / self.T)
+        x_output = (x_glu2.squeeze(-1) / self.T)
+        
+        if track:
+            activations = {
+                'input': x_input,           # (B, N, M) - after dropout
+                'fc1': x_fc1,               # (B, N, 256) - after first linear layer
+                'glu1': x_glu1,             # (B, N, 128) - after first GLU
+                'fc2': x_fc2,               # (B, N, 2) - after second linear layer
+                'glu2': x_glu2,             # (B, N, 1) - after second GLU
+                'output': x_output,         # (B, N) - final output after temperature scaling
+            }
+            return x_output, activations
+        
+        return x_output
 
 
 class PatchEmbedding(nn.Module):
@@ -466,6 +481,7 @@ class SimplifiedCTM(nn.Module):
             synch_out_tracking = []
             synch_action_tracking = []
             attention_tracking = []
+            nlm_activations_tracking = []
         
         # Recurrent loop over internal ticks
         for tick in range(self.max_ticks):
@@ -499,7 +515,14 @@ class SimplifiedCTM(nn.Module):
             state_trace = torch.cat([state_trace[:, :, 1:], new_state.unsqueeze(-1)], dim=-1)
             
             # Apply NLM
-            activated_state = self.batched_nlm(state_trace)
+            if track:
+                activated_state, nlm_activations = self.batched_nlm(state_trace, track=True)
+                nlm_activations_tracking.append({
+                    key: value.detach().cpu().numpy() 
+                    for key, value in nlm_activations.items()
+                })
+            else:
+                activated_state = self.batched_nlm(state_trace)
             
             # Calculate synchronization for output
             sync_out, decay_alpha_out, decay_beta_out = self.compute_synchronization(
@@ -528,7 +551,8 @@ class SimplifiedCTM(nn.Module):
                 (np.array(synch_out_tracking), np.array(synch_action_tracking)),
                 np.array(pre_activations_tracking),
                 np.array(post_activations_tracking),
-                np.array(attention_tracking)
+                np.array(attention_tracking),
+                nlm_activations_tracking
             )
         
         return predictions, certainties
@@ -546,7 +570,7 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     
     model.eval()
     with torch.no_grad():
-        predictions, certainties, synch, pre_act, post_act, attention = model(
+        predictions, certainties, synch, pre_act, post_act, attention, nlm_activations = model(
             image.unsqueeze(0).to(device), 
             track=True
         )
@@ -598,6 +622,105 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     print("Saved attention_visualization.png")
 
 
+def visualize_nlm_activations(model: SimplifiedCTM, image: torch.Tensor, device: torch.device, epoch: int | None = None):
+    """
+    Visualize NLM activations per tick - simple grid of line plots for each neuron.
+    
+    Args:
+        model: The CTM model
+        image: Input image tensor
+        device: Device to run on
+        epoch: Optional epoch number for filename
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    
+    model.eval()
+    with torch.no_grad():
+        predictions, certainties, synch, pre_act, post_act, attention, nlm_activations = model(
+            image.unsqueeze(0).to(device), 
+            track=True
+        )
+    
+    # Extract output activations: shape (n_ticks, batch, neurons) -> (n_ticks, neurons)
+    n_ticks = len(nlm_activations)
+    n_neurons = model.n_neurons
+    output_activations = np.array([nlm_activations[tick]['output'][0] for tick in range(n_ticks)])
+    # Shape: (n_ticks, n_neurons)
+    
+    # Create grid layout
+    n_cols = 18
+    n_rows = int(np.ceil(n_neurons / n_cols))
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, n_rows * 1.2))
+    axes = axes.flatten() if n_neurons > 1 else [axes]
+    
+    # Color map for different neurons
+    colors = cm.get_cmap('tab20')(np.linspace(0, 1, n_neurons))
+    
+    # Get synchronization pair indices
+    out_left = model.out_neuron_indices_left.cpu().numpy()
+    out_right = model.out_neuron_indices_right.cpu().numpy()
+    action_left = model.action_neuron_indices_left.cpu().numpy()
+    action_right = model.action_neuron_indices_right.cpu().numpy()
+    
+    # Create sets for quick lookup
+    out_neurons = set(out_left) | set(out_right)
+    action_neurons = set(action_left) | set(action_right)
+    
+    ticks = np.arange(n_ticks)
+    
+    for neuron_idx in range(n_neurons):
+        ax = axes[neuron_idx]
+        neuron_data = output_activations[:, neuron_idx]
+        
+        # Plot line with color
+        ax.plot(ticks, neuron_data, color=colors[neuron_idx % len(colors)], linewidth=1.5, alpha=0.8)
+        
+        # Fill area under curve
+        ax.fill_between(ticks, neuron_data, alpha=0.3, color=colors[neuron_idx % len(colors)])
+        
+        # Add border for synchronization pairs
+        if neuron_idx in out_neurons:
+            # Red border for output synchronization pairs
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color('red')
+                spine.set_linewidth(2.5)
+        elif neuron_idx in action_neurons:
+            # Blue border for action synchronization pairs
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color('blue')
+                spine.set_linewidth(2.5)
+        else:
+            # No border for non-synchronization neurons
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['bottom'].set_visible(False)
+            ax.spines['left'].set_visible(False)
+        
+        # Simple styling
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    # Hide unused subplots
+    for idx in range(n_neurons, len(axes)):
+        axes[idx].axis('off')
+    
+    title = 'NLM Activations Over Ticks (One Plot Per Neuron)'
+    if epoch is not None:
+        title += f' - Epoch {epoch+1}'
+    title += '\nRed border: Output sync pairs | Blue border: Action sync pairs'
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    
+    filename = f'nlm_activations_epoch_{epoch+1}.png' if epoch is not None else 'nlm_activations.png'
+    plt.savefig(filename, dpi=150)
+    plt.close()
+    print(f"Saved {filename}")
+
+
 def train_model(
     model: SimplifiedCTM, 
     train_loader: DataLoader, 
@@ -616,6 +739,9 @@ def train_model(
     # reduction='none' allows us to inspect loss per tick per sample
     criterion = nn.CrossEntropyLoss(reduction='none')
     
+    # Get a sample image for visualization (from first batch)
+    sample_image = None
+    
     for epoch in range(epochs):
         total_loss = 0.0
         correct = 0
@@ -623,6 +749,10 @@ def train_model(
         
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
+            
+            # Store first image from first batch for visualization
+            if epoch == 0 and batch_idx == 0:
+                sample_image = data[0]
             
             optimizer.zero_grad()
             
@@ -674,6 +804,11 @@ def train_model(
         accuracy = 100. * correct / total
         print(f'Epoch {epoch+1}/{epochs} completed - '
               f'Average Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+        
+        # Visualize NLM activations at end of each epoch
+        if sample_image is not None:
+            print(f'Generating NLM activations visualization for epoch {epoch+1}...')
+            visualize_nlm_activations(model, sample_image, device, epoch=epoch)
 
 
 def count_parameters(model: nn.Module) -> int:
