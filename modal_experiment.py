@@ -1,5 +1,5 @@
 import modal
-from ctm_opengenome import main
+from ctm_modelnet import main
 
 # Define the image with all necessary dependencies
 image = (
@@ -11,12 +11,15 @@ image = (
         "scikit-learn",
         "numpy",
         "matplotlib",
+        "torch_geometric",
+        "wandb",
     ).env({
-        "HF_TOKEN": ""
-    }).add_local_python_source("ctm_opengenome_conv1d", "ctm_opengenome", "ctm")
+        "HF_TOKEN": "",
+        "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
+    }).add_local_python_source("ctm_opengenome_conv1d", "ctm_opengenome", "ctm_modelnet", "ctm")
 )
 
-app = modal.App("ctm-opengenome-conv1d", image=image)
+app = modal.App("ctm", image=image)
 
 # Define a volume for persistent storage of datasets and models
 volume = modal.Volume.from_name("ctm-data", create_if_missing=True)
@@ -26,8 +29,8 @@ volume = modal.Volume.from_name("ctm-data", create_if_missing=True)
     volumes={"/data": volume},
     timeout=3600,
 )
-def run_training():
-    main(data_path="/data")
+def run_training(checkpoint_dir: str = "/data/checkpoints"):
+    main(data_path="/data", checkpoint_dir=checkpoint_dir)
     volume.commit()
 
 @app.local_entrypoint()

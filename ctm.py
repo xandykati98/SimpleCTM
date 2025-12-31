@@ -6,6 +6,13 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import math
 import numpy as np
+from save_utils import (
+    save_model_components,
+    load_model_components,
+    save_checkpoint,
+    load_checkpoint,
+    create_model_from_checkpoint,
+)
 
 
 def compute_normalized_entropy(predictions: torch.Tensor) -> torch.Tensor:
@@ -214,6 +221,102 @@ class LearnablePositionalEmbedding(nn.Module):
         return x + self.pos_embed
 
 
+class PerceiverPatchEmbedding(nn.Module):
+    """
+    Perceiver-style patch embedding with byte-level tokenization and Fourier positional encodings.
+    
+    Based on the original Perceiver paper (Jaegle et al., 2021):
+    - Converts any input to byte-level tokens (flatten all dimensions except batch to bytes)
+    - Uses Fourier positional encodings (sinusoidal) based on byte positions
+    - Projects to embedding dimension
+    
+    Supports inputs of any dimensionality:
+    - 1D: (B, C, L) -> flattens to (B, C*L) bytes
+    - 2D: (B, C, H, W) -> flattens to (B, C*H*W) bytes
+    - etc.
+    
+    Reference: https://arxiv.org/abs/2103.03206
+    """
+    
+    def __init__(self, input_shape: tuple[int, ...], embed_dim: int):
+        """
+        Initialize Perceiver patch embedding.
+        
+        Args:
+            input_shape: Shape of input tensor excluding batch dimension, e.g., (C, H, W) or (C, L)
+            embed_dim: Embedding dimension for output tokens
+        """
+        super(PerceiverPatchEmbedding, self).__init__()
+        self.input_shape = input_shape
+        self.embed_dim = embed_dim
+        
+        # Total number of bytes: product of all dimensions
+        self.n_bytes = int(np.prod(input_shape))
+        
+        # Linear projection from byte values to embedding dimension
+        self.byte_proj = nn.Linear(1, embed_dim)
+        
+        # Layer norm after projection
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Pre-compute Fourier positional encodings (Perceiver-style)
+        # Using sinusoidal encodings based on byte positions
+        self.register_buffer('fourier_pos_embed', self._create_fourier_pos_encoding())
+    
+    def _create_fourier_pos_encoding(self) -> torch.Tensor:
+        """
+        Create Fourier positional encodings for byte positions.
+        Uses sinusoidal functions like in the Perceiver paper.
+        
+        Returns:
+            (1, n_bytes, embed_dim) positional encoding tensor
+        """
+        pos_embed = torch.zeros(1, self.n_bytes, self.embed_dim)
+        position = torch.arange(0, self.n_bytes, dtype=torch.float32).unsqueeze(1)
+        
+        # Create sinusoidal encodings
+        # Using different frequencies for different dimensions
+        div_term = torch.exp(torch.arange(0, self.embed_dim, 2, dtype=torch.float32) * 
+                            -(math.log(10000.0) / self.embed_dim))
+        
+        pos_embed[0, :, 0::2] = torch.sin(position * div_term)
+        pos_embed[0, :, 1::2] = torch.cos(position * div_term)
+        
+        return pos_embed
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert any input to byte-level tokens with Fourier positional encodings.
+        
+        Args:
+            x: Input tensor of shape (B, ...) where ... can be any dimensions
+               Examples:
+               - 1D: (B, C, L)
+               - 2D: (B, C, H, W)
+        Returns:
+            (B, n_bytes, embed_dim) byte token embeddings with positional encoding
+        """
+        batch_size = x.shape[0]
+        
+        # Flatten all dimensions except batch to byte-level tokens
+        # (B, ...) -> (B, n_bytes) where n_bytes = product of all non-batch dimensions
+        byte_tokens = x.flatten(1)  # (B, n_bytes)
+        
+        # Reshape to treat each byte as a separate token: (B, n_bytes, 1)
+        byte_tokens = byte_tokens.unsqueeze(-1)  # (B, n_bytes, 1)
+        
+        # Project bytes to embedding dimension: (B, n_bytes, 1) -> (B, n_bytes, embed_dim)
+        byte_embeddings = self.byte_proj(byte_tokens)
+        
+        # Add Fourier positional encodings (Perceiver-style)
+        byte_embeddings = byte_embeddings + self.fourier_pos_embed
+        
+        # Apply layer norm
+        byte_embeddings = self.norm(byte_embeddings)
+        
+        return byte_embeddings
+
+
 class SimplifiedCTM(nn.Module):
     """
     Simplified Continuous Thought Machine with PROPER spatial attention.
@@ -245,6 +348,7 @@ class SimplifiedCTM(nn.Module):
         input_ndim: int = 2,
         dropout: float = 0.0,
         dropout_nlm: float = 0.0,
+        use_perceiver: bool = False,
     ):
         super(SimplifiedCTM, self).__init__()
 
@@ -258,8 +362,21 @@ class SimplifiedCTM(nn.Module):
         self.patch_size = patch_size
         self.image_size = image_size
         self.input_ndim = input_ndim
+        self.use_perceiver = use_perceiver
 
-        if self.input_ndim == 2:
+        if self.use_perceiver:
+            # Perceiver uses byte-level tokens: flatten all dimensions to bytes
+            # Compute input shape based on input_ndim
+            if self.input_ndim == 1:
+                # 1D: (C, L) where L = image_size
+                input_shape = (in_channels, image_size)
+            elif self.input_ndim == 2:
+                # 2D: (C, H, W) where H = W = image_size
+                input_shape = (in_channels, image_size, image_size)
+            else:
+                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
+            self.n_patches = int(np.prod(input_shape))
+        elif self.input_ndim == 2:
             self.n_patches = (image_size // patch_size) ** 2
         elif self.input_ndim == 1:
             self.n_patches = image_size // patch_size
@@ -286,12 +403,33 @@ class SimplifiedCTM(nn.Module):
             ))
         )
 
-        if self.input_ndim == 2:
+        if self.use_perceiver:
+            # Perceiver patch embedding with byte-level tokenization and Fourier positional encodings
+            # Compute input shape based on input_ndim
+            if self.input_ndim == 1:
+                input_shape = (in_channels, image_size)
+            elif self.input_ndim == 2:
+                input_shape = (in_channels, image_size, image_size)
+            else:
+                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
+            
+            self.patch_embed = PerceiverPatchEmbedding(
+                input_shape=input_shape,
+                embed_dim=d_input,
+            )
+            # Perceiver embedding already includes positional encoding, so no separate pos_embed needed
+            self.pos_embed = None
+        elif self.input_ndim == 2:
             self.patch_embed = PatchEmbedding(
                 image_size=image_size,
                 patch_size=patch_size,
                 in_channels=in_channels,
                 embed_dim=d_input,
+            )
+            # Positional embeddings help model understand patch locations
+            self.pos_embed = LearnablePositionalEmbedding(
+                n_patches=self.n_patches,
+                embed_dim=d_input
             )
         else:
             self.patch_embed = PatchEmbedding1D(
@@ -300,12 +438,11 @@ class SimplifiedCTM(nn.Module):
                 in_channels=in_channels,
                 embed_dim=d_input,
             )
-        
-        # Positional embeddings help model understand patch locations
-        self.pos_embed = LearnablePositionalEmbedding(
-            n_patches=self.n_patches,
-            embed_dim=d_input
-        )
+            # Positional embeddings help model understand patch locations
+            self.pos_embed = LearnablePositionalEmbedding(
+                n_patches=self.n_patches,
+                embed_dim=d_input
+            )
         
         # Key-Value projection for attention (from patch embeddings)
         self.kv_proj = nn.Sequential(
@@ -433,8 +570,9 @@ class SimplifiedCTM(nn.Module):
         # Extract and embed patches: (B, C, H, W) -> (B, n_patches, d_input)
         patch_embeddings = self.patch_embed(x)
         
-        # Add positional information
-        patch_embeddings = self.pos_embed(patch_embeddings)
+        # Add positional information (skip for Perceiver as it's already included)
+        if self.pos_embed is not None:
+            patch_embeddings = self.pos_embed(patch_embeddings)
         
         # Project to key-value space
         kv = self.kv_proj(patch_embeddings)  # (B, n_patches, d_input)
@@ -584,7 +722,6 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     # Average across heads
     attention_avg = attention.mean(axis=1)  # (n_ticks, n_patches)
     
-    grid_size = int(np.sqrt(model.n_patches))
     n_ticks_to_show = model.max_ticks
     tick_indices = np.arange(model.max_ticks)
     
@@ -592,11 +729,39 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     
     # Show original image
     img_np = image.squeeze().cpu().numpy()
+    
+    # Handle different embedding types
+    if model.use_perceiver:
+        # Perceiver: reshape attention to match image dimensions (H, W, C) -> (H, W)
+        # For byte-level tokens, we need to reshape from flattened (H*W*C) back to (H, W)
+        # Assuming single channel, reshape to (H, W)
+        h, w = model.image_size, model.image_size
+        grid_size = h
+        patch_size = 1  # Each byte is a pixel
+    else:
+        # Regular patch embedding: square grid
+        grid_size = int(np.sqrt(model.n_patches))
+        patch_size = model.patch_size
+    
     for i, tick_idx in enumerate(tick_indices):
         # Top row: attention heatmap overlaid on image
         axes[0, i].imshow(img_np, cmap='gray', alpha=0.5)
-        attn_map = attention_avg[tick_idx].reshape(grid_size, grid_size)
-        attn_resized = np.kron(attn_map, np.ones((model.patch_size, model.patch_size)))
+        
+        if model.use_perceiver:
+            # Reshape attention from (H*W*C) to (H, W) for visualization
+            # For single channel, we can reshape directly
+            attn_flat = attention_avg[tick_idx]
+            if len(attn_flat) == model.image_size * model.image_size:
+                # Single channel case: reshape to (H, W)
+                attn_map = attn_flat.reshape(model.image_size, model.image_size)
+            else:
+                # Multi-channel: take average across channels
+                attn_map = attn_flat.reshape(model.image_size, model.image_size, -1).mean(axis=-1)
+            attn_resized = attn_map  # Already pixel-level
+        else:
+            attn_map = attention_avg[tick_idx].reshape(grid_size, grid_size)
+            attn_resized = np.kron(attn_map, np.ones((patch_size, patch_size)))
+        
         axes[0, i].imshow(attn_resized, cmap='hot', alpha=0.5)
         axes[0, i].set_title(f'Tick {tick_idx}')
         axes[0, i].axis('off')
@@ -615,7 +780,10 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
         if i > 0:
             axes[2, i].set_yticks([])
     
-    plt.suptitle('Foveated Attention and Predictions Over Ticks')
+    title = 'Foveated Attention and Predictions Over Ticks'
+    if model.use_perceiver:
+        title += ' (Perceiver Byte-Level)'
+    plt.suptitle(title)
     plt.tight_layout()
     plt.savefig('attention_visualization.png', dpi=150)
     plt.show()
@@ -822,7 +990,15 @@ def print_model_info(model: SimplifiedCTM):
     print(f'Number of neurons: {model.n_neurons}')
     print(f'Memory length: {model.max_memory}')
     print(f'Max ticks: {model.max_ticks}')
-    if model.input_ndim == 2:
+    if model.use_perceiver:
+        print(f'Embedding type: Perceiver (byte-level tokens with Fourier positional encoding)')
+        print(f'Input ndim: {model.input_ndim}')
+        if model.input_ndim == 2:
+            print(f'Image size: {model.image_size}x{model.image_size}')
+        else:
+            print(f'Sequence length: {model.image_size}')
+        print(f'Number of byte tokens: {model.n_patches}')
+    elif model.input_ndim == 2:
         print(f'Input ndim: 2')
         print(f'Image size: {model.image_size}x{model.image_size}')
         print(f'Number of patches: {model.n_patches} ({model.image_size//model.patch_size}x{model.image_size//model.patch_size})')
