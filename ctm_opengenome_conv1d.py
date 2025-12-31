@@ -354,7 +354,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
             
             # Log metrics to wandb
             wandb.log({
-                "epoch": epoch + 1,
+                "epoch": epoch,
                 "train/loss": train_loss,
                 "train/accuracy": train_acc,
                 "val/loss": val_loss,
@@ -368,7 +368,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
                 best_val_f1 = f1
                 torch.save(model.state_dict(), "conv1d_best_model.pth")
                 wandb.run.summary["best_val_f1"] = f1
-                wandb.run.summary["best_epoch"] = epoch + 1
+                wandb.run.summary["best_epoch"] = epoch
                 print(f"  New best model saved! (F1={f1:.4f})")
         else:
             elapsed = time.time() - start
@@ -376,7 +376,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
             
             # Log metrics to wandb (no validation)
             wandb.log({
-                "epoch": epoch + 1,
+                "epoch": epoch,
                 "train/loss": train_loss,
                 "train/accuracy": train_acc,
                 "learning_rate": optimizer.param_groups[0]['lr'],

@@ -16,7 +16,7 @@ image = (
     ).env({
         "HF_TOKEN": "",
         "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
-    }).add_local_python_source("ctm_opengenome_conv1d", "ctm_opengenome", "ctm_modelnet", "ctm")
+    }).add_local_python_source("ctm_opengenome_conv1d", "ctm_opengenome", "ctm_modelnet", "ctm", "save_utils")
 )
 
 app = modal.App("ctm", image=image)

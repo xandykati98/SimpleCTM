@@ -123,7 +123,7 @@ class OpenGenomeCTM(nn.Module):
             n_synch_action=n_synch_action,
             n_attention_heads=n_attention_heads,
             out_dims=num_classes,
-            image_size=seq_length,
+            input_size=seq_length,
             patch_size=patch_size,
             in_channels=nucleotide_embedding_dim,
             input_ndim=1,
@@ -647,7 +647,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
             
             # Log metrics to wandb
             wandb.log({
-                "epoch": epoch + 1,
+                "epoch": epoch,
                 "train/loss": train_loss,
                 "train/accuracy": train_acc,
                 "val/loss": val_loss,
@@ -661,7 +661,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
             if f1 > best_val_f1:
                 best_val_f1 = f1
                 wandb.run.summary["best_val_f1"] = f1
-                wandb.run.summary["best_epoch"] = epoch + 1
+                wandb.run.summary["best_epoch"] = epoch
         else:
             elapsed = time.time() - start
             print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}%")
@@ -669,7 +669,7 @@ def main(data_path: str = "D:/huggingface/datasets"):
             
             # Log metrics to wandb (no validation)
             wandb.log({
-                "epoch": epoch + 1,
+                "epoch": epoch,
                 "train/loss": train_loss,
                 "train/accuracy": train_acc,
                 "learning_rate": optimizer.param_groups[0]['lr'],
@@ -684,14 +684,14 @@ def main(data_path: str = "D:/huggingface/datasets"):
             sequence=vis_sequence,
             label=vis_label,
             device=device,
-            epoch=epoch + 1,
+            epoch=epoch,
             patch_size=patch_size,
             seq_length=seq_length,
             grid_width=vis_grid_width,
         )
         
         # Log attention visualization image to wandb
-        vis_image_path = f'dna_attention_epoch_{epoch + 1}.png'
+        vis_image_path = f'dna_attention_epoch_{epoch}.png'
         if os.path.exists(vis_image_path):
             wandb.log({
                 "attention_visualization": wandb.Image(vis_image_path),

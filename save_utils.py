@@ -56,7 +56,7 @@ def save_model_components(
             'n_synch_out': model.n_synch_out,
             'n_synch_action': model.n_synch_action,
             'n_attention_heads': model.n_attention_heads,
-            'image_size': model.image_size,
+            'input_size': model.input_size,
             'patch_size': model.patch_size,
             'in_channels': in_channels,
             'input_ndim': model.input_ndim,
@@ -175,7 +175,7 @@ def save_checkpoint(
             'n_synch_out': model.n_synch_out,
             'n_synch_action': model.n_synch_action,
             'n_attention_heads': model.n_attention_heads,
-            'image_size': model.image_size,
+            'input_size': model.input_size,
             'patch_size': model.patch_size,
             'in_channels': in_channels,
             'input_ndim': model.input_ndim,
@@ -297,6 +297,11 @@ def create_model_from_checkpoint(
     config = checkpoint['model_config']
     
     # Create model with new output dimensions
+    # Backward compatibility: support both 'input_size' and 'image_size' in config
+    input_size = config.get('input_size', config.get('image_size'))
+    if input_size is None:
+        raise ValueError("Config must contain either 'input_size' or 'image_size'")
+    
     model = SimplifiedCTM(
         n_neurons=config['n_neurons'],
         max_memory=config['max_memory'],
@@ -306,7 +311,7 @@ def create_model_from_checkpoint(
         n_synch_action=config['n_synch_action'],
         n_attention_heads=config['n_attention_heads'],
         out_dims=out_dims,  # New task-specific output dimension
-        image_size=config['image_size'],
+        input_size=input_size,
         patch_size=config['patch_size'],
         in_channels=config['in_channels'],
         input_ndim=config['input_ndim'],

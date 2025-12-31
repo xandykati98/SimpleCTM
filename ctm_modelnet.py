@@ -52,7 +52,7 @@ class ModelNetDataset(torch.utils.data.Dataset):
 
 
 class ModelNetCTM(nn.Module):
-    """CTM for 3D point cloud classification using Perceiver embedding."""
+    """CTM for 3D point cloud classification with Perceiver or 3D patch embedding."""
     
     def __init__(
         self,
@@ -67,29 +67,70 @@ class ModelNetCTM(nn.Module):
         n_attention_heads: int,
         dropout: float,
         dropout_nlm: float,
+        use_perceiver: bool = True,
+        patch_size: int = 32,
     ):
+        """
+        Initialize ModelNet CTM.
+        
+        Args:
+            num_points: Number of points in point cloud
+            num_classes: Number of classification classes
+            n_neurons: Number of neurons in CTM
+            max_memory: Memory length for neuron-level models
+            max_ticks: Maximum number of internal ticks
+            d_input: Input embedding dimension
+            n_synch_out: Number of output synchronization pairs
+            n_synch_action: Number of action synchronization pairs
+            n_attention_heads: Number of attention heads
+            dropout: Dropout rate
+            dropout_nlm: Dropout rate for neuron-level models
+            use_perceiver: If True, use Perceiver byte-level embedding; if False, use 3D patch embedding
+            patch_size: Size of patches for 3D patch embedding (only used if use_perceiver=False)
+        """
         super(ModelNetCTM, self).__init__()
         
-        # CTM with Perceiver embedding
-        # Input shape: (3, num_points) -> flattened to (3 * num_points) bytes
-        # Using Perceiver to convert point cloud to byte-level tokens
-        self.ctm = SimplifiedCTM(
-            n_neurons=n_neurons,
-            max_memory=max_memory,
-            max_ticks=max_ticks,
-            d_input=d_input,
-            n_synch_out=n_synch_out,
-            n_synch_action=n_synch_action,
-            n_attention_heads=n_attention_heads,
-            out_dims=num_classes,
-            image_size=num_points,  # Used as sequence length for 1D
-            patch_size=1,  # Not used with Perceiver, but required
-            in_channels=3,  # xyz coordinates
-            input_ndim=1,  # Treat as 1D sequence
-            dropout=dropout,
-            dropout_nlm=dropout_nlm,
-            use_perceiver=True,  # Enable Perceiver embedding
-        )
+        if use_perceiver:
+            # CTM with Perceiver embedding
+            # Input shape: (3, num_points) -> flattened to (3 * num_points) bytes
+            # Using Perceiver to convert point cloud to byte-level tokens
+            self.ctm = SimplifiedCTM(
+                n_neurons=n_neurons,
+                max_memory=max_memory,
+                max_ticks=max_ticks,
+                d_input=d_input,
+                n_synch_out=n_synch_out,
+                n_synch_action=n_synch_action,
+                n_attention_heads=n_attention_heads,
+                out_dims=num_classes,
+                input_size=num_points,  # Used as sequence length for 1D
+                patch_size=1,  # Not used with Perceiver, but required
+                in_channels=3,  # xyz coordinates
+                input_ndim=1,  # Treat as 1D sequence
+                dropout=dropout,
+                dropout_nlm=dropout_nlm,
+                use_perceiver=True,  # Enable Perceiver embedding
+            )
+        else:
+            # CTM with 3D patch embedding
+            # Groups points into spatial patches using PointNet-style feature extraction
+            self.ctm = SimplifiedCTM(
+                n_neurons=n_neurons,
+                max_memory=max_memory,
+                max_ticks=max_ticks,
+                d_input=d_input,
+                n_synch_out=n_synch_out,
+                n_synch_action=n_synch_action,
+                n_attention_heads=n_attention_heads,
+                out_dims=num_classes,
+                input_size=num_points,  # Number of points
+                patch_size=patch_size,  # Points per patch
+                in_channels=3,  # xyz coordinates
+                input_ndim=3,  # 3D point cloud
+                dropout=dropout,
+                dropout_nlm=dropout_nlm,
+                use_perceiver=False,  # Use 3D patch embedding
+            )
     
     def forward(self, x: torch.Tensor, track: bool = False):
         """
@@ -152,10 +193,22 @@ def visualize_point_cloud_attention(
         # Get attention for this tick
         attn_flat = attention_avg[tick_idx]  # (n_patches,) - already numpy
         
-        # For Perceiver, n_patches = 3 * num_points (flattened xyz)
-        # Reshape to (3, num_points) and take mean across channels
+        # Handle different embedding types
         if len(attn_flat) == 3 * num_points:
+            # Perceiver: n_patches = 3 * num_points (flattened xyz)
+            # Reshape to (3, num_points) and take mean across channels
             attn_reshaped = attn_flat.reshape(3, num_points).mean(axis=0)  # (num_points,)
+        elif len(attn_flat) == num_points // model.ctm.patch_size:
+            # 3D patch embedding: n_patches = num_points // patch_size
+            # Expand patch attention to point-level by repeating for each point in patch
+            n_patches = len(attn_flat)
+            patch_size = model.ctm.patch_size
+            attn_reshaped = np.repeat(attn_flat, patch_size)  # (n_patches * patch_size,)
+            # Pad if necessary (due to truncation in patch creation)
+            if len(attn_reshaped) < num_points:
+                padding = np.zeros(num_points - len(attn_reshaped))
+                attn_reshaped = np.concatenate([attn_reshaped, padding])
+            attn_reshaped = attn_reshaped[:num_points]  # Ensure exact length
         else:
             # Fallback: assume attention matches points
             attn_reshaped = attn_flat[:num_points]
@@ -426,6 +479,7 @@ def main(data_path: str = "./data", checkpoint_dir: str = "./checkpoints", resum
         n_attention_heads=n_attention_heads,
         dropout=dropout,
         dropout_nlm=dropout_nlm,
+        use_perceiver=False,
     ).to(device)
     
     print_model_info(model.ctm)
@@ -504,20 +558,20 @@ def main(data_path: str = "./data", checkpoint_dir: str = "./checkpoints", resum
         
         # Log metrics to wandb
         wandb.log({
-            "epoch": epoch + 1,
+            "epoch": epoch,
             "train/loss": train_loss,
             "train/accuracy": train_acc,
             "val/loss": val_loss,
             "val/accuracy": val_acc,
             "learning_rate": optimizer.param_groups[0]['lr'],
             "epoch_time": elapsed,
-        })
+        }, step=epoch)
         
         # Track best validation accuracy
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             wandb.run.summary["best_val_acc"] = val_acc
-            wandb.run.summary["best_epoch"] = epoch + 1
+            wandb.run.summary["best_epoch"] = epoch
         
         # Save checkpoint after each epoch
         # Exclude output_projector for multi-task pretraining (task-specific component)
@@ -562,16 +616,16 @@ def main(data_path: str = "./data", checkpoint_dir: str = "./checkpoints", resum
                 label=vis_label,
                 class_names=class_names,
                 device=device,
-                epoch=epoch + 1,
+                epoch=epoch,
                 num_points=num_points,
             )
             
             # Log attention visualization image to wandb
-            vis_image_path = f'modelnet_attention_epoch_{epoch + 1}.png'
+            vis_image_path = f'modelnet_attention_epoch_{epoch}.png'
             if os.path.exists(vis_image_path):
                 wandb.log({
                     "attention_visualization": wandb.Image(vis_image_path),
-                })
+                }, step=epoch)
     
     # Final test evaluation
     print("\n" + "=" * 60)

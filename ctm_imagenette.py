@@ -120,11 +120,11 @@ def main():
     print(f'Using device: {device}')
     
     # Imagenette setup
-    image_size = 128
+    input_size = 128
     patch_size = 16
     
     transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+        transforms.Resize((input_size, input_size)),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     ])
@@ -144,7 +144,7 @@ def main():
         n_synch_action=32,
         n_attention_heads=4,
         out_dims=10,             # Imagenette has 10 classes
-        image_size=image_size,
+        input_size=input_size,
         patch_size=patch_size,
         in_channels=3,           # RGB
         dropout=0.1,             # Added dropout

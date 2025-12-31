@@ -126,12 +126,12 @@ class PatchEmbedding(nn.Module):
     - Attention can now focus on different patches at each tick
     """
     
-    def __init__(self, image_size: int, patch_size: int, in_channels: int, embed_dim: int):
+    def __init__(self, input_size: int, patch_size: int, in_channels: int, embed_dim: int):
         super(PatchEmbedding, self).__init__()
-        self.image_size = image_size
+        self.input_size = input_size
         self.patch_size = patch_size
-        self.n_patches = (image_size // patch_size) ** 2
-        self.grid_size = image_size // patch_size
+        self.n_patches = (input_size // patch_size) ** 2
+        self.grid_size = input_size // patch_size
         
         # Conv2d with kernel_size=stride=patch_size acts as patch extraction + linear projection
         self.proj = nn.Conv2d(
@@ -203,6 +203,86 @@ class PatchEmbedding1D(nn.Module):
         x = x.transpose(1, 2)
         x = self.norm(x)
         return x
+
+
+class PatchEmbedding3D(nn.Module):
+    """
+    Split 3D point cloud into patches and embed them using PointNet-style feature extraction.
+    
+    Groups consecutive points into patches and uses MLP + max pooling to extract patch-level features.
+    This is more efficient than byte-level tokens while preserving spatial structure.
+    
+    Expected input shape: (B, 3, num_points) where 3 = xyz coordinates
+    Output shape: (B, n_patches, embed_dim)
+    """
+
+    def __init__(self, num_points: int, patch_size: int, embed_dim: int):
+        """
+        Initialize 3D patch embedding.
+        
+        Args:
+            num_points: Number of points in the point cloud
+            patch_size: Number of points per patch
+            embed_dim: Embedding dimension for output tokens
+        """
+        super(PatchEmbedding3D, self).__init__()
+        self.num_points = num_points
+        self.patch_size = patch_size
+        self.n_patches = num_points // patch_size
+        self.embed_dim = embed_dim
+
+        if self.n_patches < 1:
+            raise ValueError(
+                f"Invalid 3D patching: num_points={num_points}, patch_size={patch_size} -> n_patches={self.n_patches}"
+            )
+
+        # PointNet-style feature extraction: MLP to extract per-point features, then max pool
+        # Input: 3D coordinates (xyz) -> extract features -> max pool over patch
+        self.point_mlp = nn.Sequential(
+            nn.Linear(3, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim // 2, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+        
+        # Final normalization
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert point cloud to patch embeddings.
+        
+        Args:
+            x: (B, 3, num_points) point cloud tensor
+        Returns:
+            (B, n_patches, embed_dim) patch embeddings
+        """
+        if x.dim() != 3:
+            raise ValueError(f"PatchEmbedding3D expects input of shape (B, 3, num_points), got shape={tuple(x.shape)}")
+        if x.shape[1] != 3:
+            raise ValueError(f"PatchEmbedding3D expects 3 channels (xyz), got {x.shape[1]} channels")
+        
+        batch_size = x.shape[0]
+        
+        # Reshape to group points into patches: (B, 3, num_points) -> (B, n_patches, patch_size, 3)
+        # First transpose to (B, num_points, 3)
+        x = x.transpose(1, 2)  # (B, num_points, 3)
+        
+        # Reshape to patches: (B, num_points, 3) -> (B, n_patches, patch_size, 3)
+        x = x[:, :self.n_patches * self.patch_size, :]  # Trim to exact multiple
+        x = x.reshape(batch_size, self.n_patches, self.patch_size, 3)
+        
+        # Extract features for each point in each patch: (B, n_patches, patch_size, 3) -> (B, n_patches, patch_size, embed_dim)
+        x = self.point_mlp(x)
+        
+        # Max pool over patch dimension to get patch-level features: (B, n_patches, patch_size, embed_dim) -> (B, n_patches, embed_dim)
+        patch_embeddings = x.max(dim=2)[0]  # Max pooling over patch_size dimension
+        
+        # Apply final normalization
+        patch_embeddings = self.norm(patch_embeddings)
+        
+        return patch_embeddings
 
 
 class LearnablePositionalEmbedding(nn.Module):
@@ -342,7 +422,7 @@ class SimplifiedCTM(nn.Module):
         n_synch_action: int,
         n_attention_heads: int,
         out_dims: int,
-        image_size: int,
+        input_size: int,
         patch_size: int,
         in_channels: int,
         input_ndim: int = 2,
@@ -360,7 +440,7 @@ class SimplifiedCTM(nn.Module):
         self.out_dims = out_dims
         self.n_attention_heads = n_attention_heads
         self.patch_size = patch_size
-        self.image_size = image_size
+        self.input_size = input_size
         self.input_ndim = input_ndim
         self.use_perceiver = use_perceiver
 
@@ -368,24 +448,34 @@ class SimplifiedCTM(nn.Module):
             # Perceiver uses byte-level tokens: flatten all dimensions to bytes
             # Compute input shape based on input_ndim
             if self.input_ndim == 1:
-                # 1D: (C, L) where L = image_size
-                input_shape = (in_channels, image_size)
+                # 1D: (C, L) where L = input_size
+                input_shape = (in_channels, input_size)
             elif self.input_ndim == 2:
-                # 2D: (C, H, W) where H = W = image_size
-                input_shape = (in_channels, image_size, image_size)
+                # 2D: (C, H, W) where H = W = input_size
+                input_shape = (in_channels, input_size, input_size)
+            elif self.input_ndim == 3:
+                # 3D: (3, num_points) where num_points = input_size
+                input_shape = (in_channels, input_size)
             else:
-                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
+                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1, 2, or 3.")
             self.n_patches = int(np.prod(input_shape))
         elif self.input_ndim == 2:
-            self.n_patches = (image_size // patch_size) ** 2
+            self.n_patches = (input_size // patch_size) ** 2
         elif self.input_ndim == 1:
-            self.n_patches = image_size // patch_size
+            self.n_patches = input_size // patch_size
             if self.n_patches < 1:
                 raise ValueError(
-                    f"Invalid 1D patching: image_size(input_length)={image_size}, patch_size={patch_size} -> n_patches={self.n_patches}"
+                    f"Invalid 1D patching: input_size(input_length)={input_size}, patch_size={patch_size} -> n_patches={self.n_patches}"
+                )
+        elif self.input_ndim == 3:
+            # 3D point cloud: group points into patches
+            self.n_patches = input_size // patch_size
+            if self.n_patches < 1:
+                raise ValueError(
+                    f"Invalid 3D patching: num_points={input_size}, patch_size={patch_size} -> n_patches={self.n_patches}"
                 )
         else:
-            raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
+            raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1, 2, or 3.")
         
         # Learnable initial states (Section 3.1 - start states)
         self.register_parameter(
@@ -407,11 +497,13 @@ class SimplifiedCTM(nn.Module):
             # Perceiver patch embedding with byte-level tokenization and Fourier positional encodings
             # Compute input shape based on input_ndim
             if self.input_ndim == 1:
-                input_shape = (in_channels, image_size)
+                input_shape = (in_channels, input_size)
             elif self.input_ndim == 2:
-                input_shape = (in_channels, image_size, image_size)
+                input_shape = (in_channels, input_size, input_size)
+            elif self.input_ndim == 3:
+                input_shape = (in_channels, input_size)
             else:
-                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1 or 2.")
+                raise ValueError(f"Invalid input_ndim: {input_ndim}. Expected 1, 2, or 3.")
             
             self.patch_embed = PerceiverPatchEmbedding(
                 input_shape=input_shape,
@@ -421,7 +513,7 @@ class SimplifiedCTM(nn.Module):
             self.pos_embed = None
         elif self.input_ndim == 2:
             self.patch_embed = PatchEmbedding(
-                image_size=image_size,
+                input_size=input_size,
                 patch_size=patch_size,
                 in_channels=in_channels,
                 embed_dim=d_input,
@@ -431,9 +523,21 @@ class SimplifiedCTM(nn.Module):
                 n_patches=self.n_patches,
                 embed_dim=d_input
             )
+        elif self.input_ndim == 3:
+            # 3D point cloud patch embedding
+            self.patch_embed = PatchEmbedding3D(
+                num_points=input_size,
+                patch_size=patch_size,
+                embed_dim=d_input,
+            )
+            # Positional embeddings help model understand patch locations
+            self.pos_embed = LearnablePositionalEmbedding(
+                n_patches=self.n_patches,
+                embed_dim=d_input
+            )
         else:
             self.patch_embed = PatchEmbedding1D(
-                input_length=image_size,
+                input_length=input_size,
                 patch_size=patch_size,
                 in_channels=in_channels,
                 embed_dim=d_input,
@@ -735,7 +839,7 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
         # Perceiver: reshape attention to match image dimensions (H, W, C) -> (H, W)
         # For byte-level tokens, we need to reshape from flattened (H*W*C) back to (H, W)
         # Assuming single channel, reshape to (H, W)
-        h, w = model.image_size, model.image_size
+        h, w = model.input_size, model.input_size
         grid_size = h
         patch_size = 1  # Each byte is a pixel
     else:
@@ -751,12 +855,12 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
             # Reshape attention from (H*W*C) to (H, W) for visualization
             # For single channel, we can reshape directly
             attn_flat = attention_avg[tick_idx]
-            if len(attn_flat) == model.image_size * model.image_size:
+            if len(attn_flat) == model.input_size * model.input_size:
                 # Single channel case: reshape to (H, W)
-                attn_map = attn_flat.reshape(model.image_size, model.image_size)
+                attn_map = attn_flat.reshape(model.input_size, model.input_size)
             else:
                 # Multi-channel: take average across channels
-                attn_map = attn_flat.reshape(model.image_size, model.image_size, -1).mean(axis=-1)
+                attn_map = attn_flat.reshape(model.input_size, model.input_size, -1).mean(axis=-1)
             attn_resized = attn_map  # Already pixel-level
         else:
             attn_map = attention_avg[tick_idx].reshape(grid_size, grid_size)
@@ -994,18 +1098,24 @@ def print_model_info(model: SimplifiedCTM):
         print(f'Embedding type: Perceiver (byte-level tokens with Fourier positional encoding)')
         print(f'Input ndim: {model.input_ndim}')
         if model.input_ndim == 2:
-            print(f'Image size: {model.image_size}x{model.image_size}')
+            print(f'Input size: {model.input_size}x{model.input_size}')
+        elif model.input_ndim == 3:
+            print(f'Point cloud size: {model.input_size} points')
         else:
-            print(f'Sequence length: {model.image_size}')
+            print(f'Sequence length: {model.input_size}')
         print(f'Number of byte tokens: {model.n_patches}')
+    elif model.input_ndim == 3:
+        print(f'Input ndim: 3 (Point Cloud)')
+        print(f'Number of points: {model.input_size}')
+        print(f'Number of patches: {model.n_patches} (patch_size={model.patch_size})')
     elif model.input_ndim == 2:
         print(f'Input ndim: 2')
-        print(f'Image size: {model.image_size}x{model.image_size}')
-        print(f'Number of patches: {model.n_patches} ({model.image_size//model.patch_size}x{model.image_size//model.patch_size})')
+        print(f'Input size: {model.input_size}x{model.input_size}')
+        print(f'Number of patches: {model.n_patches} ({model.input_size//model.patch_size}x{model.input_size//model.patch_size})')
         print(f'Patch size: {model.patch_size}x{model.patch_size}')
     else:
         print(f'Input ndim: 1')
-        print(f'Sequence length: {model.image_size}')
+        print(f'Sequence length: {model.input_size}')
         print(f'Number of patches: {model.n_patches}')
         print(f'Patch size: {model.patch_size}')
     print(f'Sync pairs (output): {model.n_synch_out}')
@@ -1036,7 +1146,7 @@ def main():
         n_synch_action=16,
         n_attention_heads=4,
         out_dims=10,
-        image_size=28,           # MNIST image size
+        input_size=28,           # MNIST image size
         patch_size=7,            # 7x7 patches -> 4x4 = 16 patches
         in_channels=1,           # MNIST is grayscale
         dropout=0.0,             # Dropout rate (set to 0.1-0.2 for regularization)
