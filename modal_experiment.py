@@ -1,5 +1,5 @@
 import modal
-from ctm_modelnet import main
+from transformer_shakespeare import main
 
 # Define the image with all necessary dependencies
 image = (
@@ -13,13 +13,14 @@ image = (
         "matplotlib",
         "torch_geometric",
         "wandb",
+        "requests",
     ).env({
         "HF_TOKEN": "",
         "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
-    }).add_local_python_source("ctm_opengenome_conv1d", "ctm_opengenome", "ctm_modelnet", "ctm", "save_utils")
+    }).add_local_python_source("transformer_shakespeare")
 )
 
-app = modal.App("ctm", image=image)
+app = modal.App("shakespeare-transformer", image=image)
 
 # Define a volume for persistent storage of datasets and models
 volume = modal.Volume.from_name("ctm-data", create_if_missing=True)

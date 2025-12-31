@@ -6,6 +6,8 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import math
 import numpy as np
+import os
+import wandb
 from ctm import SimplifiedCTM, train_model, print_model_info
 
 def visualize_attention(
@@ -13,7 +15,8 @@ def visualize_attention(
     image: torch.Tensor, 
     device: torch.device,
     target: int = None,
-    class_names: list = None
+    class_names: list = None,
+    checkpoint_dir: str = '.'
 ):
     """
     Visualize how attention weights evolve across ticks.
@@ -23,7 +26,7 @@ def visualize_attention(
     
     model.eval()
     with torch.no_grad():
-        predictions, certainties, synch, pre_act, post_act, attention = model(
+        predictions, certainties, synch, pre_act, post_act, attention, nlm_activations = model(
             image.unsqueeze(0).to(device), 
             track=True
         )
@@ -110,18 +113,21 @@ def visualize_attention(
     
     plt.suptitle('Foveated Attention and Predictions Over Ticks')
     plt.tight_layout()
-    plt.savefig('attention_visualization.png', dpi=150)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    attention_viz_path = os.path.join(checkpoint_dir, 'attention_visualization.png')
+    plt.savefig(attention_viz_path, dpi=150)
+    plt.close()
     # plt.show()
-    print("Saved attention_visualization.png")
+    print(f"Saved {attention_viz_path}")
 
 
-def main():
+def main(data_path: str = './data', checkpoint_dir: str = '.'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
     # Imagenette setup
     input_size = 128
-    patch_size = 16
+    patch_size = 8
     
     transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
@@ -131,32 +137,84 @@ def main():
     
     print("Loading Imagenette dataset...")
     # Use Imagenette
-    train_dataset = datasets.Imagenette(root='./data', split='train', download=True, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    batch_size = 32
+    train_dataset = datasets.Imagenette(root=data_path, split='train', download=True, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # Model hyperparameters
+    n_neurons = 128
+    max_memory = 6
+    max_ticks = 10
+    d_input = 128
+    n_synch_out = 32
+    n_synch_action = 32
+    n_attention_heads = 2
+    out_dims = 10
+    in_channels = 3
+    dropout = 0.1
+    dropout_nlm = 0.1
     
     # Initialize model with spatial patches for foveated attention
     model = SimplifiedCTM(
-        n_neurons=128,           # Increased for Imagenette
-        max_memory=20,
-        max_ticks=15,
-        d_input=128,             # Increased embedding dimension
-        n_synch_out=32,
-        n_synch_action=32,
-        n_attention_heads=4,
-        out_dims=10,             # Imagenette has 10 classes
+        n_neurons=n_neurons,
+        max_memory=max_memory,
+        max_ticks=max_ticks,
+        d_input=d_input,
+        n_synch_out=n_synch_out,
+        n_synch_action=n_synch_action,
+        n_attention_heads=n_attention_heads,
+        out_dims=out_dims,
         input_size=input_size,
         patch_size=patch_size,
-        in_channels=3,           # RGB
-        dropout=0.1,             # Added dropout
-        dropout_nlm=0.1,
+        in_channels=in_channels,
+        dropout=dropout,
+        dropout_nlm=dropout_nlm,
     ).to(device)
     
     print_model_info(model)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Training hyperparameters
+    epochs = 10
+    lr = 0.001
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # Compute total parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Wandb config
+    wandb_config = {
+        "input_size": input_size,
+        "patch_size": patch_size,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "lr": lr,
+        "optimizer": optimizer.__class__.__name__,
+        "n_neurons": n_neurons,
+        "max_memory": max_memory,
+        "max_ticks": max_ticks,
+        "d_input": d_input,
+        "n_synch_out": n_synch_out,
+        "n_synch_action": n_synch_action,
+        "n_attention_heads": n_attention_heads,
+        "out_dims": out_dims,
+        "in_channels": in_channels,
+        "dropout": dropout,
+        "dropout_nlm": dropout_nlm,
+        "total_params": total_params,
+        "train_size": len(train_dataset),
+        "device": str(device),
+    }
+    
+    # Initialize wandb
+    wandb.init(
+        project="imagenette",
+        name=f"ctm_{optimizer.__class__.__name__}",
+        config=wandb_config
+    )
     
     # Train for a few epochs
-    train_model(model, train_loader, optimizer, epochs=1, device=device)
+    train_model(model, train_loader, optimizer, epochs=epochs, device=device, use_wandb=True)
     
     # Visualize the foveated attention behavior
     print("\nVisualizing attention patterns...")
@@ -171,10 +229,15 @@ def main():
             'French horn', 'garbage truck', 'gas pump', 'golf ball', 'parachute'
         ]
         
-    visualize_attention(model, test_image, device, target=test_label, class_names=class_names)
+    visualize_attention(model, test_image, device, target=test_label, class_names=class_names, checkpoint_dir=checkpoint_dir)
     
-    torch.save(model.state_dict(), 'ctm_imagenette_model.pth')
-    print('Model saved to ctm_imagenette_model.pth')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    model_path = os.path.join(checkpoint_dir, 'ctm_imagenette_model.pth')
+    torch.save(model.state_dict(), model_path)
+    print(f'Model saved to {model_path}')
+    
+    # Finish wandb run
+    wandb.finish()
 
 
 if __name__ == '__main__':

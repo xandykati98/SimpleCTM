@@ -6,6 +6,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import math
 import numpy as np
+import wandb
 from save_utils import (
     save_model_components,
     load_model_components,
@@ -800,10 +801,20 @@ class SimplifiedCTM(nn.Module):
         return predictions, certainties
 
 
-def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch.device):
+def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch.device, use_wandb: bool = False, epoch: int | None = None) -> str:
     """
     Visualize how attention weights evolve across ticks.
     This shows the foveated attention behavior!
+    
+    Args:
+        model: The CTM model
+        image: Input image tensor
+        device: Device to run on
+        use_wandb: If True, log visualization to wandb
+        epoch: Optional epoch number for filename
+    
+    Returns:
+        Filename of saved visualization
     """
     import matplotlib.pyplot as plt
 
@@ -887,14 +898,25 @@ def visualize_attention(model: SimplifiedCTM, image: torch.Tensor, device: torch
     title = 'Foveated Attention and Predictions Over Ticks'
     if model.use_perceiver:
         title += ' (Perceiver Byte-Level)'
+    if epoch is not None:
+        title += f' - Epoch {epoch+1}'
     plt.suptitle(title)
     plt.tight_layout()
-    plt.savefig('attention_visualization.png', dpi=150)
-    plt.show()
-    print("Saved attention_visualization.png")
+    filename = f'attention_visualization_epoch_{epoch+1}.png' if epoch is not None else 'attention_visualization.png'
+    plt.savefig(filename, dpi=150)
+    plt.close()
+    print(f"Saved {filename}")
+    
+    # Log to wandb if requested
+    if use_wandb:
+        wandb.log({
+            "attention_visualization": wandb.Image(filename),
+        })
+    
+    return filename
 
 
-def visualize_nlm_activations(model: SimplifiedCTM, image: torch.Tensor, device: torch.device, epoch: int | None = None):
+def visualize_nlm_activations(model: SimplifiedCTM, image: torch.Tensor, device: torch.device, epoch: int | None = None) -> str:
     """
     Visualize NLM activations per tick - simple grid of line plots for each neuron.
     
@@ -903,6 +925,9 @@ def visualize_nlm_activations(model: SimplifiedCTM, image: torch.Tensor, device:
         image: Input image tensor
         device: Device to run on
         epoch: Optional epoch number for filename
+    
+    Returns:
+        Filename of saved visualization
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
@@ -991,6 +1016,69 @@ def visualize_nlm_activations(model: SimplifiedCTM, image: torch.Tensor, device:
     plt.savefig(filename, dpi=150)
     plt.close()
     print(f"Saved {filename}")
+    return filename
+
+
+def evaluate(
+    model: SimplifiedCTM,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float, float, float]:
+    """
+    Evaluate model on validation/test set.
+    
+    Args:
+        model: The CTM model to evaluate
+        loader: DataLoader for validation/test data
+        device: Device to run evaluation on
+    
+    Returns:
+        Tuple of (average_loss, accuracy, average_certainty, average_tick_index)
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    total_certainty = 0.0
+    total_tick_index = 0.0
+    
+    # Handle empty loader
+    if len(loader) == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            predictions, certainties = model(data)
+            
+            # Use adaptive compute: select prediction at most certain tick
+            most_certain_indices = certainties[:, 1, :].argmax(dim=1)
+            batch_indices = torch.arange(data.size(0), device=device)
+            final_predictions = predictions[batch_indices, :, most_certain_indices]
+            
+            loss = criterion(final_predictions, target)
+            total_loss += loss.item()
+            
+            _, predicted = torch.max(final_predictions, dim=1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+            
+            # Track certainty and tick index
+            batch_certainty = certainties[batch_indices, 1, most_certain_indices]
+            total_certainty += batch_certainty.sum().item()
+            total_tick_index += most_certain_indices.float().sum().item()
+    
+    if total == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    
+    return (
+        total_loss / len(loader), 
+        100. * correct / total,
+        total_certainty / total,
+        total_tick_index / total
+    )
 
 
 def train_model(
@@ -999,6 +1087,8 @@ def train_model(
     optimizer: optim.Optimizer, 
     epochs: int, 
     device: torch.device,
+    val_loader: DataLoader | None = None,
+    use_wandb: bool = False,
 ):
     """
     Training loop with adaptive compute loss (Section 3.5 & Appendix E.2).
@@ -1006,6 +1096,15 @@ def train_model(
     The loss function encourages the model to:
     1. Find the correct answer eventually (min_loss across ticks)
     2. Be confident about the correct answer (loss at most certain tick)
+    
+    Args:
+        model: The CTM model to train
+        train_loader: DataLoader for training data
+        optimizer: Optimizer for training
+        epochs: Number of training epochs
+        device: Device to run training on
+        val_loader: Optional DataLoader for validation data
+        use_wandb: If True, log metrics to wandb
     """
     model.train()
     # reduction='none' allows us to inspect loss per tick per sample
@@ -1074,13 +1173,59 @@ def train_model(
         
         avg_loss = total_loss / len(train_loader)
         accuracy = 100. * correct / total
-        print(f'Epoch {epoch+1}/{epochs} completed - '
-              f'Average Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+        
+        # Evaluate on validation set if provided
+        val_loss = None
+        val_acc = None
+        val_certainty = None
+        val_tick_index = None
+        if val_loader is not None:
+            val_loss, val_acc, val_certainty, val_tick_index = evaluate(model, val_loader, device)
+            print(f'Epoch {epoch+1}/{epochs} completed - '
+                  f'Train Loss: {avg_loss:.4f}, Train Acc: {accuracy:.2f}% | '
+                  f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, '
+                  f'Val Certainty: {val_certainty:.3f}, Val Avg Tick: {val_tick_index:.2f}')
+        else:
+            print(f'Epoch {epoch+1}/{epochs} completed - '
+                  f'Average Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+        
+        # Log epoch metrics to wandb
+        if use_wandb:
+            log_dict = {
+                "train/epoch_loss": avg_loss,
+                "train/epoch_accuracy": accuracy,
+                "epoch": epoch,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+            }
+            if val_loss is not None and val_acc is not None:
+                log_dict["val/loss"] = val_loss
+                log_dict["val/accuracy"] = val_acc
+            if val_certainty is not None:
+                log_dict["val/certainty"] = val_certainty
+            if val_tick_index is not None:
+                log_dict["val/avg_tick_index"] = val_tick_index
+            wandb.log(log_dict, step=epoch)
         
         # Visualize NLM activations at end of each epoch
         if sample_image is not None:
             print(f'Generating NLM activations visualization for epoch {epoch+1}...')
-            visualize_nlm_activations(model, sample_image, device, epoch=epoch)
+            nlm_filename = visualize_nlm_activations(model, sample_image, device, epoch=epoch)
+            
+            # Log NLM activations visualization to wandb
+            if use_wandb and nlm_filename:
+                wandb.log({
+                    "nlm_activations": wandb.Image(nlm_filename),
+                }, step=epoch)
+            
+            # Visualize attention at end of each epoch
+            print(f'Generating attention visualization for epoch {epoch+1}...')
+            attention_filename = visualize_attention(model, sample_image, device, use_wandb=False, epoch=epoch)
+            
+            # Log attention visualization to wandb
+            if use_wandb and attention_filename:
+                wandb.log({
+                    "attention_visualization": wandb.Image(attention_filename),
+                }, step=epoch)
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -1134,39 +1279,99 @@ def main():
     ])
     
     train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    val_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
+    # Model hyperparameters
+    n_neurons = 64
+    max_memory = 10
+    max_ticks = 15
+    d_input = 64
+    n_synch_out = 32
+    n_synch_action = 16
+    n_attention_heads = 4
+    out_dims = 10
+    input_size = 28
+    patch_size = 7
+    in_channels = 1
+    dropout = 0.0
+    dropout_nlm = 0.0
+    batch_size = 32
+    epochs = 3
+    lr = 0.001
     
     # Initialize model with spatial patches for foveated attention
     model = SimplifiedCTM(
-        n_neurons=64,
-        max_memory=10,
-        max_ticks=15,
-        d_input=64,              # Embedding dimension for patches
-        n_synch_out=32,
-        n_synch_action=16,
-        n_attention_heads=4,
-        out_dims=10,
-        input_size=28,           # MNIST image size
-        patch_size=7,            # 7x7 patches -> 4x4 = 16 patches
-        in_channels=1,           # MNIST is grayscale
-        dropout=0.0,             # Dropout rate (set to 0.1-0.2 for regularization)
-        dropout_nlm=0.0,         # Separate dropout for NLMs (0.0 = use dropout)
+        n_neurons=n_neurons,
+        max_memory=max_memory,
+        max_ticks=max_ticks,
+        d_input=d_input,
+        n_synch_out=n_synch_out,
+        n_synch_action=n_synch_action,
+        n_attention_heads=n_attention_heads,
+        out_dims=out_dims,
+        input_size=input_size,
+        patch_size=patch_size,
+        in_channels=in_channels,
+        dropout=dropout,
+        dropout_nlm=dropout_nlm,
     ).to(device)
     
     print_model_info(model)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Compute total parameters
+    total_params = count_parameters(model)
+    
+    # Wandb config
+    wandb_config = {
+        "input_size": input_size,
+        "patch_size": patch_size,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "lr": lr,
+        "optimizer": "Adam",
+        "n_neurons": n_neurons,
+        "max_memory": max_memory,
+        "max_ticks": max_ticks,
+        "d_input": d_input,
+        "n_synch_out": n_synch_out,
+        "n_synch_action": n_synch_action,
+        "n_attention_heads": n_attention_heads,
+        "out_dims": out_dims,
+        "in_channels": in_channels,
+        "dropout": dropout,
+        "dropout_nlm": dropout_nlm,
+        "total_params": total_params,
+        "train_size": len(train_dataset),
+        "val_size": len(val_dataset),
+        "device": str(device),
+        "use_perceiver": model.use_perceiver,
+        "input_ndim": model.input_ndim,
+    }
+    
+    # Initialize wandb
+    wandb.init(
+        project="mnist",
+        name=f"ctm_mnist_ep{epochs}",
+        config=wandb_config
+    )
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     
     # Train for a few epochs
-    train_model(model, train_loader, optimizer, epochs=3, device=device)
+    train_model(model, train_loader, optimizer, epochs=epochs, device=device, val_loader=val_loader, use_wandb=True)
     
     # Visualize the foveated attention behavior
     print("\nVisualizing attention patterns...")
     test_image, _ = train_dataset[0]
-    visualize_attention(model, test_image, device)
+    attention_filename = visualize_attention(model, test_image, device, use_wandb=True)
     
     torch.save(model.state_dict(), 'ctm_spatial_model.pth')
     print('Model saved to ctm_spatial_model.pth')
+    
+    # Finish wandb run
+    wandb.finish()
 
 
 if __name__ == '__main__':
