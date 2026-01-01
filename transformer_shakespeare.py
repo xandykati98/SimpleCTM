@@ -1,272 +1,301 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-import os
-import requests
-import wandb
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Dict, List, Optional
+import math
+import os
+import wandb
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
-# --- Data Loading ---
-
-def get_shakespeare_data(data_path: str) -> str:
-    """Download and return the Tiny Shakespeare dataset."""
-    file_path: str = os.path.join(data_path, "input.txt")
-    if not os.path.exists(file_path):
-        os.makedirs(data_path, exist_ok=True)
-        url: str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-        print(f"Downloading Shakespeare dataset from {url}...")
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(response.text)
-    
-    with open(file_path, "r", encoding="utf-8") as f:
-        text: str = f.read()
-    
-    return text
 
 class ShakespeareDataset(Dataset):
-    """Dataset for character-level language modeling."""
-    def __init__(self, text: str, block_size: int):
-        chars: List[str] = sorted(list(set(text)))
-        self.vocab_size: int = len(chars)
-        self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(chars)}
-        self.itos: Dict[int, str] = {i: ch for i, ch in enumerate(chars)}
-        self.block_size: int = block_size
-        self.data: torch.Tensor = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
+    """Shakespeare dataset using custom BPE tokenization for efficiency."""
+    
+    def __init__(self, data_path: str, seq_len: int, split: str = 'train', vocab_size: int = 1024):
+        self.seq_len = seq_len
+        self.tokenizer_path = os.path.join(data_path, f'tokenizer_shakespeare_bytelevel_{vocab_size}.json')
+        
+        # Download or load Shakespeare text
+        shakespeare_path = os.path.join(data_path, 'shakespeare.txt')
+        if not os.path.exists(shakespeare_path):
+            os.makedirs(data_path, exist_ok=True)
+            import urllib.request
+            url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+            urllib.request.urlretrieve(url, shakespeare_path)
+        
+        # Train or load tokenizer
+        if os.path.exists(self.tokenizer_path):
+            self.tokenizer = Tokenizer.from_file(self.tokenizer_path)
+        else:
+            print(f"Training new ByteLevel BPE tokenizer with vocab size {vocab_size}...")
+            self.tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+            self.tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+            self.tokenizer.decoder = ByteLevelDecoder()
+            
+            trainer = BpeTrainer(
+                special_tokens=["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"], 
+                vocab_size=vocab_size,
+                initial_alphabet=ByteLevel.alphabet()
+            )
+            self.tokenizer.train([shakespeare_path], trainer)
+            self.tokenizer.save(self.tokenizer_path)
+            print("Tokenizer trained and saved.")
 
+        self.vocab_size = self.tokenizer.get_vocab_size()
+        
+        with open(shakespeare_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+            
+        # Encode text
+        encoded = self.tokenizer.encode(text)
+        self.data = torch.tensor(encoded.ids, dtype=torch.long)
+        
+        # Split data
+        n = len(self.data)
+        train_data = self.data[:int(n * 0.9)]
+        val_data = self.data[int(n * 0.9):]
+        
+        self.data = train_data if split == 'train' else val_data
+    
     def __len__(self) -> int:
-        return len(self.data) - self.block_size
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        chunk: torch.Tensor = self.data[idx : idx + self.block_size + 1]
-        x: torch.Tensor = chunk[:-1]
-        y: torch.Tensor = chunk[1:]
+        return max(0, len(self.data) - self.seq_len - 1)
+    
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.data[idx:idx + self.seq_len]
+        y = self.data[idx + 1:idx + self.seq_len + 1]
         return x, y
+    
+    def decode(self, indices: torch.Tensor) -> str:
+        if isinstance(indices, torch.Tensor):
+            indices = indices.tolist()
+        return self.tokenizer.decode(indices)
+    
+    def encode(self, text: str) -> torch.Tensor:
+        return torch.tensor(self.tokenizer.encode(text).ids, dtype=torch.long)
 
-# --- Transformer Components ---
 
-class Head(nn.Module):
-    """One head of self-attention."""
-    def __init__(self, n_embd: int, head_size: int, block_size: int, dropout: float):
+class TransformerBlock(nn.Module):
+    """Standard Transformer Block."""
+    
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
-        self.key: nn.Linear = nn.Linear(n_embd, head_size, bias=False)
-        self.query: nn.Linear = nn.Linear(n_embd, head_size, bias=False)
-        self.value: nn.Linear = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.dropout: nn.Dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        k: torch.Tensor = self.key(x)   # (B, T, head_size)
-        q: torch.Tensor = self.query(x) # (B, T, head_size)
-        
-        # Compute attention scores ("affinities")
-        wei: torch.Tensor = q @ k.transpose(-2, -1) * (C**-0.5) # (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        
-        # Weighted aggregation
-        v: torch.Tensor = self.value(x) # (B, T, head_size)
-        out: torch.Tensor = wei @ v    # (B, T, head_size)
-        return out
-
-class MultiHeadAttention(nn.Module):
-    """Multiple heads of self-attention in parallel."""
-    def __init__(self, n_heads: int, n_embd: int, head_size: int, block_size: int, dropout: float):
-        super().__init__()
-        self.heads: nn.ModuleList = nn.ModuleList([Head(n_embd, head_size, block_size, dropout) for _ in range(n_heads)])
-        self.proj: nn.Linear = nn.Linear(n_embd, n_embd)
-        self.dropout: nn.Dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out: torch.Tensor = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-class FeedForward(nn.Module):
-    """Simple linear layer followed by a non-linearity."""
-    def __init__(self, n_embd: int, dropout: float):
-        super().__init__()
-        self.net: nn.Sequential = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-class Block(nn.Module):
-    """Transformer block: communication followed by computation."""
-    def __init__(self, n_embd: int, n_heads: int, block_size: int, dropout: float):
-        super().__init__()
-        head_size: int = n_embd // n_heads
-        self.sa: MultiHeadAttention = MultiHeadAttention(n_heads, n_embd, head_size, block_size, dropout)
-        self.ffwd: FeedForward = FeedForward(n_embd, dropout)
-        self.ln1: nn.LayerNorm = nn.LayerNorm(n_embd)
-        self.ln2: nn.LayerNorm = nn.LayerNorm(n_embd)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        # Pre-norm architecture
+        x_norm = self.ln1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=mask, need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
         return x
 
-class ShakespeareTransformer(nn.Module):
-    """Full GPT-style Transformer model."""
-    def __init__(self, vocab_size: int, n_embd: int, n_heads: int, n_layers: int, block_size: int, dropout: float):
+
+class TransformerLM(nn.Module):
+    """GPT-style Transformer for language modeling."""
+    
+    def __init__(
+        self, 
+        vocab_size: int,
+        max_seq_len: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.token_embedding_table: nn.Embedding = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table: nn.Embedding = nn.Embedding(block_size, n_embd)
-        self.blocks: nn.Sequential = nn.Sequential(*[Block(n_embd, n_heads, block_size, dropout) for _ in range(n_layers)])
-        self.ln_f: nn.LayerNorm = nn.LayerNorm(n_embd)
-        self.lm_head: nn.Linear = nn.Linear(n_embd, vocab_size)
-        self.block_size: int = block_size
+        self.max_seq_len = max_seq_len
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        self.dropout = nn.Dropout(dropout)
+        
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, dropout)
+            for _ in range(n_layers)
+        ])
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Tie weights
+        self.token_embed.weight = self.head.weight
+        
+        self.apply(self._init_weights)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, T = idx.shape
-        tok_emb: torch.Tensor = self.token_embedding_table(idx) # (B, T, n_embd)
-        pos_emb: torch.Tensor = self.position_embedding_table(torch.arange(T, device=idx.device)) # (T, n_embd)
-        x: torch.Tensor = tok_emb + pos_emb # (B, T, n_embd)
-        x = self.blocks(x)    # (B, T, n_embd)
-        x = self.ln_f(x)      # (B, T, n_embd)
-        logits: torch.Tensor = self.lm_head(x) # (B, T, vocab_size)
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits_reshaped: torch.Tensor = logits.view(B*T, C)
-            targets_reshaped: torch.Tensor = targets.view(B*T)
-            loss = F.cross_entropy(logits_reshaped, targets_reshaped)
-
-        return logits, loss
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S = x.shape
+        device = x.device
+        
+        # Embeddings
+        x = self.token_embed(x) + self.pos_embed[:, :S, :]
+        x = self.dropout(x)
+        
+        # Causal mask
+        mask = torch.triu(torch.ones(S, S, device=device), diagonal=1).bool()
+        
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x, mask=mask)
+            
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
+        self.eval()
+        generated = prompt.clone()
         for _ in range(max_new_tokens):
-            idx_cond: torch.Tensor = idx[:, -self.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] # (B, C)
-            probs: torch.Tensor = F.softmax(logits, dim=-1) # (B, C)
-            idx_next: torch.Tensor = torch.multinomial(probs, num_samples=1) # (B, 1)
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
+            context = generated[:, -self.max_seq_len:]
+            logits = self(context)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
+        return generated
 
-# --- Main Training Function ---
 
-def main(data_path: str = "./data", checkpoint_dir: str = "."):
-    # Hyperparameters
-    batch_size: int = 64
-    block_size: int = 256
-    max_iters: int = 5000
-    eval_interval: int = 500
-    learning_rate: float = 3e-4
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    eval_iters: int = 200
-    n_embd: int = 384
-    n_heads: int = 6
-    n_layers: int = 6
-    dropout: float = 0.2
-    
-    print(f"Using device: {device}")
-    
-    text: str = get_shakespeare_data(data_path)
-    dataset: ShakespeareDataset = ShakespeareDataset(text, block_size)
-    vocab_size: int = dataset.vocab_size
-    
-    # Split data
-    n: int = int(0.9 * len(text))
-    train_data: str = text[:n]
-    val_data: str = text[n:]
-    
-    train_dataset: ShakespeareDataset = ShakespeareDataset(train_data, block_size)
-    val_dataset: ShakespeareDataset = ShakespeareDataset(val_data, block_size)
-    
-    train_loader: DataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader: DataLoader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    model: ShakespeareTransformer = ShakespeareTransformer(
-        vocab_size=vocab_size,
-        n_embd=n_embd,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        block_size=block_size,
-        dropout=dropout
-    ).to(device)
-    
-    optimizer: torch.optim.AdamW = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    
-    wandb.init(
-        project="shakespeare-transformer",
-        config={
-            "batch_size": batch_size,
-            "block_size": block_size,
-            "learning_rate": learning_rate,
-            "n_embd": n_embd,
-            "n_heads": n_heads,
-            "n_layers": n_layers,
-            "dropout": dropout,
-            "vocab_size": vocab_size,
-        }
-    )
-    
-    print("Starting training...")
+def train_model(
+    model: TransformerLM,
+    train_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    epochs: int,
+    device: torch.device,
+    dataset: ShakespeareDataset,
+    val_loader: DataLoader | None = None,
+    use_wandb: bool = False,
+):
     model.train()
-    
-    # Iterative training loop
-    data_iter = iter(train_loader)
-    for i in range(max_iters):
-        try:
-            xb, yb = next(data_iter)
-        except StopIteration:
-            data_iter = iter(train_loader)
-            xb, yb = next(data_iter)
+    for epoch in range(epochs):
+        total_loss = 0.0
+        total_tokens = 0
+        
+        for batch_idx, (x, y) in enumerate(train_loader):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
             
-        xb, yb = xb.to(device), yb.to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            total_loss += loss.item() * x.numel()
+            total_tokens += x.numel()
+            
+            # Batch-level statistics for wandb
+            if use_wandb:
+                batch_perplexity = math.exp(loss.item())
+                wandb.log({
+                    "batch/loss": loss.item(),
+                    "batch/perplexity": batch_perplexity,
+                    "epoch": epoch,
+                })
+            
+            if batch_idx % 100 == 0:
+                print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, Loss: {loss.item():.4f}')
         
-        _, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        avg_loss = total_loss / total_tokens
+        perplexity = math.exp(avg_loss)
         
-        if i % eval_interval == 0 or i == max_iters - 1:
+        # Validation
+        val_loss = None
+        if val_loader is not None:
             model.eval()
+            val_total_loss = 0.0
+            val_total_tokens = 0
             with torch.no_grad():
-                val_losses: List[float] = []
-                val_iter = iter(val_loader)
-                for _ in range(min(eval_iters, len(val_loader))):
-                    try:
-                        xv, yv = next(val_iter)
-                        xv, yv = xv.to(device), yv.to(device)
-                        _, v_loss = model(xv, yv)
-                        val_losses.append(v_loss.item())
-                    except StopIteration:
-                        break
-                avg_val_loss: float = sum(val_losses) / len(val_losses) if val_losses else 0.0
-            
-            print(f"Step {i}: train loss {loss.item():.4f}, val loss {avg_val_loss:.4f}")
-            wandb.log({"train_loss": loss.item(), "val_loss": avg_val_loss, "step": i})
-            
-            # Generate sample text
-            context: torch.Tensor = torch.zeros((1, 1), dtype=torch.long, device=device)
-            generated: List[int] = model.generate(context, max_new_tokens=100)[0].tolist()
-            sample_text: str = "".join([dataset.itos[idx] for idx in generated])
-            print(f"Sample generation:\n{sample_text}\n" + "-"*30)
-            
+                for vx, vy in val_loader:
+                    vx, vy = vx.to(device), vy.to(device)
+                    v_logits = model(vx)
+                    v_loss = F.cross_entropy(v_logits.reshape(-1, v_logits.size(-1)), vy.reshape(-1))
+                    val_total_loss += v_loss.item() * vx.numel()
+                    val_total_tokens += vx.numel()
+            val_loss = val_total_loss / val_total_tokens
+            print(f'Epoch {epoch+1} - Train Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f}')
             model.train()
 
-    # Save model
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    model_path: str = os.path.join(checkpoint_dir, "shakespeare_transformer.pth")
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+        if use_wandb:
+            wandb.log({"train/loss": avg_loss, "val/loss": val_loss, "epoch": epoch})
+            
+        # Sample generation
+        model.eval()
+        prompt = "Alexander then said "
+        prompt_tokens = dataset.encode(prompt).unsqueeze(0).to(device)
+        with torch.no_grad():
+            generated = model.generate(prompt_tokens, max_new_tokens=100, temperature=0.8)
+        print(f"\n--- Epoch {epoch+1} Sample ---")
+        print(dataset.decode(generated[0]))
+        print("----------------------------\n")
+        model.train()
+
+
+def main(data_path: str = './data', checkpoint_dir: str = '.'):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
     
+    seq_len = 64
+    batch_size = 32
+    target_vocab_size = 1024
+    
+    train_dataset = ShakespeareDataset(data_path=data_path, seq_len=seq_len, split='train', vocab_size=target_vocab_size)
+    val_dataset = ShakespeareDataset(data_path=data_path, seq_len=seq_len, split='val', vocab_size=target_vocab_size)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+    
+    # Matching CTM model size roughly (d_model=128)
+    model = TransformerLM(
+        vocab_size=train_dataset.vocab_size,
+        max_seq_len=seq_len,
+        d_model=128,
+        n_heads=4,
+        n_layers=4,
+        dropout=0.1
+    ).to(device)
+    
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    optimizer = optim.AdamW(model.parameters(), lr=0.001)
+    
+    wandb.init(project="shakespeare", name="transformer_baseline")
+    
+    train_model(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        epochs=2,
+        device=device,
+        dataset=train_dataset,
+        val_loader=val_loader,
+        use_wandb=True
+    )
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'transformer_shakespeare.pth'))
     wandb.finish()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
 
