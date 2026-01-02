@@ -28,7 +28,7 @@ volume = modal.Volume.from_name("ctm-data", create_if_missing=True)
 @app.function(
     gpu="any",
     volumes={"/data": volume},
-    timeout=3600 * 6,
+    timeout=3600 * 8,
 )
 def run_training(checkpoint_dir: str = "/data/checkpoints"):
     main(data_path="/data", checkpoint_dir=checkpoint_dir)

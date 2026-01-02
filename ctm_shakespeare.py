@@ -14,7 +14,6 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from PIL import Image
 
-
 def compute_normalized_entropy(predictions: torch.Tensor) -> torch.Tensor:
     """
     Compute normalized entropy from predictions.
@@ -147,17 +146,17 @@ class CausalCTM(nn.Module):
             dropout=dropout,
         )
         
-        # Learnable initial states per position
+        # Learnable initial states per position (position-dependent for diverse queries)
         self.register_parameter(
             'start_activated_state', 
-            nn.Parameter(torch.zeros(n_neurons).uniform_(
+            nn.Parameter(torch.zeros(max_seq_len, n_neurons).uniform_(
                 -math.sqrt(1/n_neurons), 
                 math.sqrt(1/n_neurons)
             ))
         )
         self.register_parameter(
             'start_trace', 
-            nn.Parameter(torch.zeros(n_neurons, max_memory).uniform_(
+            nn.Parameter(torch.zeros(max_seq_len, n_neurons, max_memory).uniform_(
                 -math.sqrt(1/(n_neurons + max_memory)), 
                 math.sqrt(1/(n_neurons + max_memory))
             ))
@@ -317,8 +316,9 @@ class CausalCTM(nn.Module):
         causal_mask = self._create_causal_mask(seq_len, device)
         
         # Initialize per-position states: (B, S, N) and (B, S, N, M)
-        activated_state = self.start_activated_state.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1).clone()
-        state_trace = self.start_trace.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1, -1).clone()
+        # Use position-dependent initial states for diverse queries at tick 1
+        activated_state = self.start_activated_state[:seq_len].unsqueeze(0).expand(batch_size, -1, -1).clone()
+        state_trace = self.start_trace[:seq_len].unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
         
         # Prepare output storage
         predictions = torch.empty(batch_size, seq_len, self.vocab_size, self.max_ticks, device=device)
@@ -775,9 +775,14 @@ def train_model(
     model.train()
     criterion = nn.CrossEntropyLoss(reduction='none')
     
+    # Calculate visualization interval (10 times per epoch)
+    n_visualizations = 10
+    viz_interval = max(1, len(train_loader) // n_visualizations)
+    
     for epoch in range(epochs):
         total_loss = 0.0
         total_tokens = 0
+        viz_count = 0
         
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
@@ -836,6 +841,35 @@ def train_model(
                 print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
                       f'Loss: {loss.item():.4f}, '
                       f'Certainty: {avg_certainty:.3f}')
+            
+            # Visualize attention 10 times per epoch
+            if batch_idx % viz_interval == 0 and viz_count < n_visualizations:
+                viz_count += 1
+                model.eval()
+                sample_idx = np.random.randint(len(dataset))
+                sample_x, sample_y = dataset[sample_idx]
+                save_path = None
+                if checkpoint_dir:
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    save_path = os.path.join(checkpoint_dir, f'attention_epoch_{epoch+1}_viz_{viz_count}.png')
+                
+                fig_buffer = visualize_attention_evolution(
+                    model=model,
+                    tokens=sample_x.unsqueeze(0),
+                    targets=sample_y.unsqueeze(0),
+                    dataset=dataset,
+                    device=device,
+                    query_position=-1,
+                    top_k=10,
+                    save_path=save_path,
+                )
+                
+                if use_wandb:
+                    fig_buffer.seek(0)
+                    pil_image = Image.open(fig_buffer)
+                    wandb.log({f"attention_evolution/epoch_{epoch+1}_viz_{viz_count}": wandb.Image(pil_image)})
+                
+                model.train()
         
         avg_loss = total_loss / total_tokens
         perplexity = math.exp(avg_loss)
@@ -895,31 +929,6 @@ def train_model(
         print(sample_text)
         print("----------------------------\n")
         
-        # Visualize attention evolution at end of each epoch
-        print(f"Visualizing attention evolution for epoch {epoch+1}...")
-        sample_idx = np.random.randint(len(dataset))
-        sample_x, sample_y = dataset[sample_idx]
-        save_path = None
-        if checkpoint_dir:
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            save_path = os.path.join(checkpoint_dir, f'attention_evolution_epoch_{epoch+1}.png')
-        
-        fig_buffer = visualize_attention_evolution(
-            model=model,
-            tokens=sample_x.unsqueeze(0),
-            targets=sample_y.unsqueeze(0),
-            dataset=dataset,
-            device=device,
-            query_position=-1,
-            top_k=10,
-            save_path=save_path,
-        )
-        
-        if use_wandb:
-            fig_buffer.seek(0)
-            pil_image = Image.open(fig_buffer)
-            wandb.log({f"attention_evolution/epoch_{epoch+1}": wandb.Image(pil_image)})
-        
         model.train()
 
 
@@ -961,13 +970,13 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     # Model hyperparameters
     n_neurons = 210
     max_memory = 8
-    max_ticks = 8
+    max_ticks = 22
     d_model = 128
     n_synch_out = 64
     n_synch_action = 32
     n_attention_heads = 4
     dropout = 0.1
-    epochs = 2
+    epochs = 1
     lr = 0.001
     
     # Initialize model
@@ -986,7 +995,8 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     
     print_model_info(model, batch_size=batch_size, epochs=epochs, lr=lr)
     
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    # Create AdamW optimizer for all parameters
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     # Wandb config
     total_params = count_parameters(model)
@@ -996,6 +1006,7 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
         "batch_size": batch_size,
         "epochs": epochs,
         "lr": lr,
+        "optimizer": "AdamW",
         "n_neurons": n_neurons,
         "max_memory": max_memory,
         "max_ticks": max_ticks,
@@ -1012,7 +1023,7 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     
     wandb.init(
         project="shakespeare",
-        name=f"causal_ctm_ep{epochs}",
+        name=f"causal_ctm_ticks{max_ticks}",
         config=wandb_config
     )
     
