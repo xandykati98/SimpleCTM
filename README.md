@@ -10,7 +10,7 @@ Modern AI often ignores the timing and synchronization in biological brains for 
 
 Inspired by the original work: [Continuous Thought Machines](https://pub.sakana.ai/ctm/) and [Sakana AI](http://sakana.ai/ctm/).
 
-## Installation 🛠️
+## Installation 
 
 ### Option 1: Install as a package (Recommended)
 
@@ -40,7 +40,7 @@ pip install -e .
    ```
    (Requires PyTorch, Torchvision – check `requirements.txt` for details)
 
-## Usage 🎮
+## Usage 
 
 ### As a Python package
 
@@ -52,50 +52,31 @@ from simplectm import ctm
 
 ### Running scripts directly
 
+Run my experiments using the Modal API:
+```bash
+modal run simplectm/modal_experiment.py # This will run last experiment I am doing on the modal_experiment.py
+modal run simplectm/modal_router.py::run_training_imagenette # Or by targeting a specific experiment on the modal_router.py
+
+```
 Run the training script:
 ```bash
-python -m simplectm.ctm
+python -m simplectm.ctm 
 ```
 
 Or if running from the repository root:
 ```bash
-python simplectm/ctm.py
-```
-
-Or using the Modal API:
-```bash
-modal run simplectm/modal_experiment.py # This will run last experiment I am doing on the modal_experiment.py
+python simplectm/ctm.py 
 ```
 
 This will:
 - Download MNIST
 - Train the SimplifiedCTM model for 10 epochs
 - Print progress and accuracy
-- Save the model to `ctm_model.pth`
+- Save the model to `ctm_spatial_model`
 
 Customize hyperparameters in `main()` – like number of neurons, max ticks, epochs.
 
-Example output:
-```
-Using device: cpu
-=== Model Information ===
-Total trainable parameters: 276,052
-...
-Epoch 1/10 completed - Average Loss: 2.3026, Accuracy: 11.24%
-...
-Model saved to ctm_model.pth
-```
-
-## How It Works 🧠
-
-- **Image Encoding**: Flattens and reduces MNIST images to a 4D vector.
-- **Internal Ticks**: Loops over time steps, updating pre/post activations.
-- **Synapse Model**: Connects neurons with image input.
-- **Neuron-Level Models**: Each neuron processes its activation history.
-- **Synchronization**: Computes weighted dot products between neuron pairs with learnable decay.
-- **Attention**: Synchronizations query the encoded image.
-- **Prediction**: Reads combined features for classification.
-- **Early Stopping**: Stops thinking when confident (>80%) or max ticks reached.
+---
 
 For full details, dive into `ctm.py` or the original [Sakana AI CTM page](https://pub.sakana.ai/ctm/).
 
