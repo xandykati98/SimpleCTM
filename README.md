@@ -62,6 +62,11 @@ Or if running from the repository root:
 python simplectm/ctm.py
 ```
 
+Or using the Modal API:
+```bash
+modal run simplectm/modal_experiment.py # This will run last experiment I am doing on the modal_experiment.py
+```
+
 This will:
 - Download MNIST
 - Train the SimplifiedCTM model for 10 epochs
