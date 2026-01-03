@@ -3,7 +3,7 @@ from ctm_shakespeare import main
 
 # Define the image with all necessary dependencies
 image = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
         "torch",
         "torchvision",

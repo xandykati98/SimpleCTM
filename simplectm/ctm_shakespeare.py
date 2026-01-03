@@ -826,18 +826,18 @@ def train_model(
             total_tokens += batch_size * seq_len
             
             # Batch-level statistics for wandb
-            if use_wandb:
-                avg_certainty = certainties[:, :, 1, :].max(dim=-1).values.mean().item()
-                batch_perplexity = math.exp(loss.item())
-                wandb.log({
-                    "batch/loss": loss.item(),
-                    "batch/certainty": avg_certainty,
-                    "batch/perplexity": batch_perplexity,
-                    "epoch": epoch,
-                })
+            
             
             if batch_idx % 100 == 0:
                 avg_certainty = certainties[:, :, 1, :].max(dim=-1).values.mean().item()
+                if use_wandb:
+                    batch_perplexity = math.exp(loss.item())
+                    wandb.log({
+                        "batch/loss": loss.item(),
+                        "batch/certainty": avg_certainty,
+                        "batch/perplexity": batch_perplexity,
+                        "epoch": epoch,
+                    })
                 print(f'Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}, '
                       f'Loss: {loss.item():.4f}, '
                       f'Certainty: {avg_certainty:.3f}')
@@ -867,7 +867,7 @@ def train_model(
                 if use_wandb:
                     fig_buffer.seek(0)
                     pil_image = Image.open(fig_buffer)
-                    wandb.log({f"attention_evolution/epoch_{epoch+1}_viz_{viz_count}": wandb.Image(pil_image)})
+                    wandb.log({f"attention_evolution": wandb.Image(pil_image)})
                 
                 model.train()
         
@@ -952,8 +952,8 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     print(f'Using device: {device}')
     
     # Dataset parameters
-    seq_len = 64
-    batch_size = 32
+    seq_len = 256        
+    batch_size = 8
     target_vocab_size = 1024  # Custom BPE vocab size
     
     print("Loading Shakespeare dataset...")
@@ -970,14 +970,14 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     # Model hyperparameters
     n_neurons = 210
     max_memory = 8
-    max_ticks = 22
+    max_ticks = 16
     d_model = 128
     n_synch_out = 64
     n_synch_action = 32
     n_attention_heads = 4
     dropout = 0.1
-    epochs = 1
-    lr = 0.001
+    epochs = 5
+    lr = 0.003
     
     # Initialize model
     model = CausalCTM(
@@ -1023,7 +1023,7 @@ def main(data_path: str = './data', checkpoint_dir: str = '.'):
     
     wandb.init(
         project="shakespeare",
-        name=f"causal_ctm_ticks{max_ticks}",
+        name=f"{optimizer.__class__.__name__}seq{seq_len}_ticks{max_ticks}/{max_memory}bs{batch_size}",
         config=wandb_config
     )
     
