@@ -8,3 +8,4 @@ dna_*.png
 *.pth
 wandb/
 nlm_activations_epoch_*.png
+simplectm.egg-info/
