@@ -3,9 +3,19 @@ venv
 __pycache__
 mlflow.db
 cache*
-dna_*.png
+dna_attention_*.png
 
 *.pth
 wandb/
 nlm_activations_epoch_*.png
 simplectm.egg-info/
+
+uv.lock 
+autoresearch/
+
+.venv/
+.ruff_cache/
+
+tea_debug.log
+
+attention_epoch_*.png

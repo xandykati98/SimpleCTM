@@ -29,6 +29,7 @@ image = (
         "ctm_imagenette",
         "ctm_opengenome",
         "ctm_opengenome_conv1d",
+        "opengenome_cache",
         "ctm", 
         "save_utils"
     )

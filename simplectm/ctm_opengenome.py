@@ -15,6 +15,7 @@ from datasets import load_dataset, concatenate_datasets, DownloadConfig
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
 from ctm import SimplifiedCTM, print_model_info
 import wandb
+from opengenome_cache import default_opengenome_data_path
 
 # Enable HuggingFace datasets progress bars
 os.environ["HF_DATASETS_VERBOSE"] = "1"
@@ -154,9 +155,17 @@ def visualize_dna_attention(
     """
     model.eval()
     with torch.no_grad():
-        predictions, certainties, synch, pre_act, post_act, attention = model(
+        (
+            predictions,
+            certainties,
+            _synch,
+            _pre_act,
+            _post_act,
+            attention,
+            _nlm_track,
+        ) = model(
             sequence.unsqueeze(0).to(device),
-            track=True
+            track=True,
         )
     
     # Get sequence as characters
@@ -271,11 +280,10 @@ def visualize_dna_attention(
     print(f"  Saved dna_attention_epoch_{epoch}.png")
 
 
-def load_opengenome_stage2(max_seq_length: int, use_cache: bool, data_path: str = "D:/huggingface/datasets") -> tuple:
+def load_opengenome_stage2(max_seq_length: int, use_cache: bool, data_path: str) -> tuple:
     """Load LongSafari/open-genome stage2 train/validation/test splits, filtered to target families and length."""
     from datasets import Dataset
     
-    # Set cache directory to D: drive
     cache_dir = data_path
     os.makedirs(cache_dir, exist_ok=True)
     
@@ -501,7 +509,7 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main(data_path: str = "D:/huggingface/datasets"):
+def main(data_path: str):
     # Config
     seq_length = 8192
     patch_size = 16
@@ -759,4 +767,4 @@ def main(data_path: str = "D:/huggingface/datasets"):
 
 
 if __name__ == "__main__":
-    main()
+    main(data_path=default_opengenome_data_path())

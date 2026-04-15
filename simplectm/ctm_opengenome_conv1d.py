@@ -15,6 +15,7 @@ from typing import List
 from datasets import Dataset
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
 import wandb
+from opengenome_cache import default_opengenome_data_path
 
 # DNA encoding
 DNA_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
@@ -55,7 +56,8 @@ class OpenGenomeDataset(torch.utils.data.Dataset):
         return len(self.data)
     
     def __getitem__(self, idx: int):
-        item = self.data[idx]
+        idx_int = int(idx)
+        item = self.data[idx_int]
         sequence = extract_sequence(item["text"])
         encoded = encode_sequence(sequence, self.max_len)
         label = FAMILY_TO_IDX[item["family"]]
@@ -129,7 +131,7 @@ class Conv1DGenomeClassifier(nn.Module):
         return x
 
 
-def load_cached_dataset(max_seq_length: int, data_path: str = "D:/huggingface/datasets") -> tuple:
+def load_cached_dataset(max_seq_length: int, data_path: str) -> tuple:
     """Load the cached filtered dataset."""
     cache_dir = data_path
     filtered_cache_dir = os.path.join(cache_dir, f"opengenome_filtered_maxlen{max_seq_length}")
@@ -232,7 +234,7 @@ def evaluate(
     return total_loss / len(loader), 100. * correct / total, all_preds, all_labels
 
 
-def main(data_path: str = "D:/huggingface/datasets"):
+def main(data_path: str):
     # Config
     seq_length = 8192
     batch_size = 32  # Can be larger since Conv1D is simpler
@@ -450,5 +452,5 @@ def main(data_path: str = "D:/huggingface/datasets"):
 
 
 if __name__ == "__main__":
-    main()
+    main(data_path=default_opengenome_data_path())
 
